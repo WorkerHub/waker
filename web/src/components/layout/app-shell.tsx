@@ -1,4 +1,11 @@
-import { CalendarClockIcon, FolderKanbanIcon, LogOutIcon, ZapIcon } from 'lucide-react'
+import {
+  CalendarClockIcon,
+  FolderKanbanIcon,
+  LogOutIcon,
+  ScrollTextIcon,
+  TriangleAlertIcon,
+  ZapIcon,
+} from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 
 import { ThemeToggle } from '@/components/theme-toggle'
@@ -10,11 +17,13 @@ import { useSession } from '@/stores/session'
 /**
  * 应用外壳：品牌 + 导航 + 主题切换 + 退出 + 页脚版本号。
  *
- * F1 只挂「任务管理」「项目管理」两页；执行记录 / 死信（F2）与设置 / 系统管理（F3）
- * 由后续子单追加到同一份 `NAV_ITEMS`，届时不需要改外壳结构。
+ * 导航顺序即作业流：任务 → 执行记录 → 死信 → 项目。
+ * F3（设置 / 系统管理）后续子单追加到同一份 `NAV_ITEMS`，不需要改外壳结构。
  */
 const NAV_ITEMS = [
   { to: '/jobs', label: '任务管理', icon: CalendarClockIcon },
+  { to: '/executions', label: '执行记录', icon: ScrollTextIcon },
+  { to: '/dead-letters', label: '死信队列', icon: TriangleAlertIcon },
   { to: '/projects', label: '项目管理', icon: FolderKanbanIcon },
 ] as const
 
