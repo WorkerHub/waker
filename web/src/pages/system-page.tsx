@@ -13,6 +13,9 @@ import { Link } from 'react-router-dom'
 
 import { DetailRow, DetailSection } from '@/components/detail-rows'
 import { PageHeader } from '@/components/page-header'
+import { EmailSettingsCard } from '@/components/system/email-settings-card'
+import { RegistrationCard } from '@/components/system/registration-card'
+import { UserManagementCard } from '@/components/system/user-management-card'
 import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -27,9 +30,15 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { ApiError, getSystemStatus, isNotImplementedError, type SystemStatus } from '@/lib/api'
 import { formatDateTime, formatRelative } from '@/lib/format'
+import { useMe } from '@/hooks/use-me'
 
 /**
- * 系统管理页（F3）。
+ * 系统管理页（F3 + SPEC §4.3 / §6.1）。
+ *
+ * 两块内容，权限面不同：
+ *   - **只读状态快照**：`GET /api/system/status`，登录即可看（viewer 也能）；
+ *   - **管理面**（用户管理 / 注册开关 / 邮件服务）：仅 admin 渲染。这只是「不给入口」，
+ *     真正的判定在后端 —— viewer 直接打这些接口一律 403（`requireAdmin` + `viewerWriteGuard`）。
  *
  * 数据面只有一个接口，且全是 B4 冻结契约里已有的字段：
  *
@@ -46,6 +55,8 @@ export function SystemPage() {
   const queryClient = useQueryClient()
   const statusQuery = useQuery({ queryKey: ['system-status'], queryFn: getSystemStatus })
   const status = statusQuery.data
+  const meQuery = useMe()
+  const isAdmin = meQuery.data?.user.role === 'admin'
 
   return (
     <div className="flex flex-col gap-5">
@@ -64,6 +75,32 @@ export function SystemPage() {
           </Button>
         }
       />
+
+      {meQuery.data !== undefined && !isAdmin && (
+        <Alert>
+          <ShieldAlertIcon />
+          <AlertTitle>管理面仅管理员可见</AlertTitle>
+          <AlertDescription>
+            用户管理、注册开关与邮件服务只有管理员能操作（当前账号是只读）。接口层同样会拒绝：viewer 的写请求一律 403。
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {isAdmin && (
+        <section className="flex flex-col gap-3">
+          <div className="flex flex-col gap-0.5">
+            <h2 className="text-base font-semibold tracking-tight">管理</h2>
+            <p className="text-xs text-muted-foreground">
+              角色、注册开关与邮件服务都在这里维护；改动立即生效（角色每次请求都从 WakerDO 读）。
+            </p>
+          </div>
+          <UserManagementCard />
+          <div className="grid gap-3 lg:grid-cols-2">
+            <RegistrationCard />
+            <EmailSettingsCard />
+          </div>
+        </section>
+      )}
 
       {statusQuery.isError && (
         <Alert variant="destructive">

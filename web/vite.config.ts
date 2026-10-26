@@ -41,6 +41,9 @@ export default defineConfig({
           react: ['react', 'react-dom', 'react-router-dom'],
           data: ['@tanstack/react-query', 'zustand'],
           forms: ['react-hook-form', 'zod', '@hookform/resolvers'],
+          // 第二因素的浏览器端依赖（WebAuthn 交互 + 二维码）单独成块：
+          // 只在登录第二步 / 设置安全区用到，不跟首屏管理面挤在一个 chunk 里。
+          auth: ['@simplewebauthn/browser', 'qrcode'],
         },
       },
     },

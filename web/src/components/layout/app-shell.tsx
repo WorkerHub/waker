@@ -7,11 +7,13 @@ import {
   ServerCogIcon,
   SettingsIcon,
   TriangleAlertIcon,
+  UserRoundIcon,
   ZapIcon,
 } from 'lucide-react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 
 import { ThemeToggle } from '@/components/theme-toggle'
+import { Badge } from '@/components/ui/badge'
 import { VersionFooter } from '@/components/version-footer'
 import { Button } from '@/components/ui/button'
 import {
@@ -21,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { useMe } from '@/hooks/use-me'
 import { useSession } from '@/stores/session'
 
 /**
@@ -45,6 +48,9 @@ const SYSTEM_ITEMS = [
 
 export function AppShell() {
   const logout = useSession((state) => state.logout)
+  const user = useSession((state) => state.user)
+  // 每次进入管理面都核对一次 `/api/me`：降级 / 禁用 / 改名在下次刷新就生效（权限仍在接口层）。
+  useMe()
   const { pathname } = useLocation()
   const inSystemSection = SYSTEM_ITEMS.some((item) => pathname.startsWith(item.to))
 
@@ -109,6 +115,17 @@ export function AppShell() {
                 ))}
               </DropdownMenuContent>
             </DropdownMenu>
+            {user !== null && (
+              <span className="hidden items-center gap-1.5 pr-1 sm:flex">
+                <UserRoundIcon className="size-3.5 text-muted-foreground" />
+                <span className="max-w-32 truncate text-xs text-muted-foreground">
+                  {user.displayName}
+                </span>
+                <Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>
+                  {user.role === 'admin' ? '管理员' : '只读'}
+                </Badge>
+              </span>
+            )}
             <ThemeToggle />
             <Button variant="ghost" size="sm" onClick={logout}>
               <LogOutIcon />

@@ -2,7 +2,8 @@
  * 管理面 API 客户端 —— 严格对齐 B4 冻结的管理面契约（`src/api/management.ts`）。
  *
  * 契约要点（前端不自造字段、不额外拼参数）：
- *   - `POST /api/auth/setup` 用 `SETUP_SECRET` 换 12 小时会话 JWT；
+ *   - 鉴权面（初始化 / 注册 / 两步登录 / 本人设置 / 用户管理）见 `lib/auth-api.ts`；
+ *     `SETUP_SECRET` 换 `sub:'owner'` 会话的旧路径已随后端 ONE-462 删除，这里不再提供；
  *   - 其余 `/api/*` 一律 `Authorization: Bearer <session.token>`；
  *   - 错误体统一 `{ error: { code, message, details? } }`，`code` 是冻结契约里的稳定错误码。
  *
@@ -370,7 +371,15 @@ export function setAuthToken(token: string | null): void {
   authToken = token
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * 公开鉴权路径：这些端点的 401 是「凭据不正确 / 尚未完成第二因素」，不是「会话过期」，
+ * 不能触发清本地会话回登录页（否则登录失败会把用户正在用的会话也清掉）。
+ */
+function isPublicAuthPath(path: string): boolean {
+  return path === '/api/setup' || path.startsWith('/api/auth/')
+}
+
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body !== undefined) headers.set('content-type', 'application/json')
   if (authToken !== null) headers.set('authorization', `Bearer ${authToken}`)
@@ -390,7 +399,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         ? `该接口尚未挂载（HTTP ${response.status}）`
         : (raw?.message ?? `请求失败（HTTP ${response.status}）`)
 
-    if (response.status === 401 && path !== '/api/auth/setup') {
+    if (response.status === 401 && !isPublicAuthPath(path)) {
       authToken = null
       onUnauthorized()
     }
@@ -405,7 +414,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T
 }
 
-function jsonBody(value: unknown): string {
+export function jsonBody(value: unknown): string {
   return JSON.stringify(value ?? {})
 }
 
@@ -421,17 +430,10 @@ function queryString(entries: Array<[string, string | number | null | undefined]
 
 // ───────────────────────── 会话 ─────────────────────────
 
+/** 会话令牌（正式会话 12 小时，`/api/me` 与所有管理面请求都靠它）。 */
 export interface SessionInfo {
   token: string
   expiresAt: number
-}
-
-export async function createSession(setupSecret: string): Promise<SessionInfo> {
-  const body = await request<{ session: SessionInfo }>('/api/auth/setup', {
-    method: 'POST',
-    body: jsonBody({ setupSecret }),
-  })
-  return body.session
 }
 
 // ───────────────────────── 任务 ─────────────────────────
