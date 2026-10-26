@@ -78,7 +78,14 @@ client/src/receiver.ts  createWakerReceiver / mountWakerReceiver（Hono 挂载 /
 client/src/client.ts    注册客户端：whoami / 清单对账 / one-shot 创建与取消
 client/src/modes.ts     双模式判定（WAKER_MODE，缺省 cron）
 examples/reference-worker/  参考接入示例：同一份任务逻辑 + 两套 wrangler 配置（原生 / waker）
-scripts/check-single-cron.mjs  硬约束守卫（Cron 数量 / 禁 D1·KV）
+web/                    管理面前端（Vite + React + shadcn/ui，构建产物由 Worker 静态资源托管）
+web/src/App.tsx         路由表（/login、/jobs、/projects）+ 会话守卫
+web/src/pages/          任务管理页 / 项目管理页 / 登录页
+web/src/components/     外壳、一次性凭据对话框、任务与项目组件
+web/src/components/ui/  shadcn/ui 组件（Nova 风格，registry 原样落库）
+web/src/lib/api.ts      管理面 API client（B4 契约的出入参类型 + 错误码）
+web/src/stores/         会话 store（zustand）
+scripts/web/sync-shadcn.py  shadcn registry 同步脚本（组件源码唯一来源）scripts/check-single-cron.mjs  硬约束守卫（Cron 数量 / 禁 D1·KV）
 scripts/ci/gen-secrets-file.sh 密钥管线（逐键非空 → secrets.json 0600）
 .github/workflows/ci.yml        CI：typecheck / lint / 守卫 / test / build
 .github/workflows/deploy.yml    手动部署（用户关口，凭据未配齐即跳过）
@@ -321,14 +328,62 @@ WakerDO（`src/do/input.ts`），HTTP 层只做参数搬运 + 错误码映射，
 > 它演示原生模式时必然带自己的 `[triggers]`，这部分单独统计（只能在 `examples/**` 的 `.toml` 配置里、
 > 每文件最多 1 处），不计入平台预算。
 
+## 管理面前端（F1：任务管理 + 项目管理）
+
+技术栈按舰队标准：Vite + React 19 + TypeScript；shadcn/ui（Nova 风格，Radix 基础）+
+Tailwind v4；图标 Lucide；主题 `next-themes`；服务端状态 `@tanstack/react-query`；
+表单 `react-hook-form` + `zod`；会话状态 `zustand`；提示 `sonner`。
+组件源码来自 registry（`scripts/web/sync-shadcn.py` 拉取并改写别名），不是手写等价物。
+
+| 页面 | 路由 | 对着的契约 |
+|---|---|---|
+| 登录 / 首次安装 | `/login` | `POST /api/auth/setup`（`SETUP_SECRET` → 12 小时会话 JWT） |
+| 任务管理 | `/jobs` | `GET/POST /api/jobs`、`PATCH /api/jobs/{id}`、`pause` / `resume` / `cancel` / `trigger` |
+| 项目管理 | `/projects` | `GET/POST /api/projects`、`PATCH /api/projects/{id}`、`token/rotate`、`signing-key/rotate` |
+
+契约原则（与 B2/B4 一致，前端不自造字段）：
+
+- 任务列表的筛选与翻页原样映射到 `listJobs` 的 `projectId` / `kind` / `status` / `limit` / `cursor`，
+  前端不做本地二次过滤；`nextCursor` 是唯一翻页依据（分页器只维护游标栈，不编页码）。
+- 策略字段（`misfire` / `concurrency` / `maxRetries` / `backoffSeconds` / `timeoutSeconds` /
+  `jitterSeconds`）的上下限与 B2 冻结契约一致，前端只做即时校验；cron 表达式与 IANA 时区的
+  真假判定一律交给后端 CF 方言解析器，`invalid_cron` 的 `details.cron.dialectCode` 原样展示。
+- 编辑走 `PATCH`，不换 job id；`name` / `kind` / `projectId` 是唯一键与任务系列的一部分，界面只读。
+- `cancel` 是终态：已取消 / 已完成的任务不展示暂停、恢复、取消与手动触发入口；`forbid` /
+  终态判定等调度语义全部在 WakerDO，前端只收敛入口可见性。
+
+凭据只展示一次（规格硬要求，页面与测试都钉住）：
+
+- 建项目 / 轮换令牌 / 轮换 signing key 的应答里带明文 → 只在「一次性凭据」对话框里出现；
+  点「复制」写入剪贴板后面文立即遮蔽（遮罩 + 显示开关，仍只在本轮内存里）；
+  关闭对话框即卸载组件，明文随之丢弃。
+- 明文不进 localStorage / sessionStorage / 日志；列表与详情只显示 `tokenFingerprint`
+  与 `signingKey.fingerprint`，轮换入口就在旁边。
+
+页面托管方式：`web/dist` 由 Worker 的 `[assets]` 直接托管（`not_found_handling = "single-page-application"`），
+`/api/*`、`/v1/*`、`/healthz` 用 `run_worker_first` 强制进 Worker —— 所以同一域名下管理面与 API 同源，
+不需要 CORS、不需要第二个部署单元。
+
+前端自测：
+
+```bash
+pnpm --filter @waker/web test        # vitest + jsdom：列表加载 / 新建任务 / 手动触发 / 凭据一次展示
+pnpm --filter @waker/web typecheck
+pnpm --filter @waker/web lint
+```
+
+组件要新增或升级时重跑 `python3 scripts/web/sync-shadcn.py`（脚本会按 registry 的
+`registryDependencies` 递归拉取并统一改写 import 别名与图标占位符）。
+
 ## 本地开发
 
 ```bash
 pnpm install
 cp .dev.vars.example .dev.vars   # 本地占位密钥，.dev.vars 已被 gitignore
-pnpm dev                          # wrangler dev
-pnpm verify                       # typecheck + lint + 守卫 + test + build
-pnpm test                         # vitest：cron 方言 / 策略纯逻辑 / DO 集成（workerd 真跑）
+pnpm dev                          # 构建管理面 → wrangler dev（http://127.0.0.1:8787，含 SPA）
+pnpm dev:web                      # 前端热更新（vite 5173，/api 与 /v1 代理到 8787 的 wrangler dev）
+pnpm verify                       # typecheck + lint + 守卫 + test + build（含管理面前端）
+pnpm test                         # 构建管理面 → vitest：cron 方言 / 策略 / DO 集成（workerd 真跑）+ 前端 smoke
 ```
 
 DO 集成测试用 wrangler 的 `createTestHarness`（Miniflare → workerd），读的是本仓真实的
@@ -388,4 +443,5 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 | B3 | 执行引擎：Queue 分发 + 回调协议 v2（HMAC）+ 重试/DLQ + 自续 |
 | B4 | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
 | B5 | 客户端 SDK（`client/`）+ 参考接入示例（`examples/reference-worker/`，双模式可选接入） |
-| F1-F3 | 管理面前端（任务 / 执行记录 / 死信三页 + 项目管理 / 设置 / 关于 / 系统管理） |
+| F1 | 管理面：任务管理页 + 项目管理页（一次性凭据展示） |
+| F2-F3 | 执行记录页 / 死信页、设置与系统管理页 |
