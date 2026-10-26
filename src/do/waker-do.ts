@@ -4,6 +4,22 @@ import { MAX_SELF_RENEWAL_HORIZON_MS, resolveCallbackUrl } from '../callback/pro
 import { createCronSchedule, type CronSchedule } from '../cron'
 import type { Env, JobMessage } from '../env'
 import { queueDelaySeconds, retryDelaySeconds } from '../queue/backoff'
+import { AuthService } from './auth-service'
+import type {
+  BootstrapTokenView,
+  EmailSendConfig,
+  MeView,
+  OneTimeCodeView,
+  PasskeyView,
+  PasswordLoginView,
+  SetupStateView,
+  SystemSettingsView,
+  TwoFactorMethod,
+  UpdateEmailSettingsInput,
+  UpdateUserInput,
+  UserView,
+  WebAuthnOptionsView,
+} from './auth-types'
 import { ok, toFailure, WakerError } from './errors'
 import {
   MAX_NAME_LENGTH,
@@ -255,6 +271,9 @@ interface TickOutcome {
 export class WakerDO extends DurableObject<Env> {
   /** signing key 的 KEK（惰性派生，每实例一次；不落库、不进日志）。 */
   #kek: Promise<CryptoKey> | null = null
+
+  /** 用户体系 / 2FA / 邮件配置的业务实现（ONE-462；惰性构造，语义见 `do/auth-service.ts`）。 */
+  #authService: AuthService | null = null
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -801,6 +820,9 @@ export class WakerDO extends DurableObject<Env> {
   async syncAlarm(): Promise<WakerResult<SyncAlarmResult>> {
     try {
       const result = await this.#runTick(Date.now())
+      // 一次性鉴权状态（邮件 OTP / TOTP 防重放 / bootstrap 令牌 / 限流计数）顺带清理：
+      // SPEC §2 要求「过期/已消费行由 watchdog tick 顺带清理（不新占 Cron）」。
+      this.#auth().prune(result.now)
       // watchdog 账本：管理面「系统管理」页用它显示上次校正时刻与处理量。
       // 只记统计量与时刻，不含任务载荷与凭据。
       writeMeta(this.ctx.storage.sql, WATCHDOG_LAST_RUN_AT, String(result.now))
@@ -2244,5 +2266,211 @@ export class WakerDO extends DurableObject<Env> {
     } catch (error) {
       return toFailure(error)
     }
+  }
+
+  // ───────────────────────── 用户体系 / 2FA / 邮件配置（ONE-462） ─────────────────────────
+  //
+  // 全部是**薄 RPC 包装**：参数校验、限流、一次性状态、落库语义都在 `do/auth-service.ts`。
+  // 这样 RPC 面一眼能看全「鉴权暴露了哪些能力」，业务规则又只有一份。
+
+  #auth(): AuthService {
+    this.#authService ??= new AuthService(this.ctx.storage.sql, this.env)
+    return this.#authService
+  }
+
+  async #authCall<T>(run: (auth: AuthService) => Promise<T> | T): Promise<WakerResult<T>> {
+    try {
+      return ok(await run(this.#auth()))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  async authSetupState(): Promise<WakerResult<SetupStateView>> {
+    return this.#authCall((auth) => auth.setupState())
+  }
+
+  async authBeginSetup(input: { setupSecret: unknown; ip: string }): Promise<WakerResult<BootstrapTokenView>> {
+    return this.#authCall((auth) => auth.beginSetup(input))
+  }
+
+  async authCreateFirstAdmin(input: {
+    bootstrapToken: unknown
+    email: unknown
+    password: unknown
+    displayName: unknown
+  }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.createFirstAdmin(input))
+  }
+
+  async authRegister(input: {
+    email: unknown
+    password: unknown
+    displayName: unknown
+    ip: string
+  }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.register(input))
+  }
+
+  async authBeginLogin(input: {
+    email: unknown
+    password: unknown
+    ip: string
+  }): Promise<WakerResult<PasswordLoginView>> {
+    return this.#authCall((auth) => auth.beginLogin(input))
+  }
+
+  async authVerifyTotp(input: { sessionRef: unknown; code: unknown }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.verifyTotpLogin(input))
+  }
+
+  async authVerifyEmailOtp(input: { sessionRef: unknown; code: unknown }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.verifyEmailOtpLogin(input))
+  }
+
+  async authSendLoginEmailOtp(input: { sessionRef: unknown }): Promise<WakerResult<OneTimeCodeView>> {
+    return this.#authCall((auth) => auth.sendLoginEmailOtp(input))
+  }
+
+  async authDiscardChallenge(input: { challengeId: unknown }): Promise<WakerResult<{ discarded: boolean }>> {
+    return this.#authCall((auth) => auth.discardChallenge(input))
+  }
+
+  async authPasskeyLoginOptions(input: {
+    sessionRef: unknown
+    rpId: unknown
+  }): Promise<WakerResult<WebAuthnOptionsView>> {
+    return this.#authCall((auth) => auth.passkeyLoginOptions(input))
+  }
+
+  async authPasskeyLoginVerify(input: {
+    sessionRef: unknown
+    rpId: unknown
+    origin: unknown
+    response: unknown
+  }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.passkeyLoginVerify(input))
+  }
+
+  async authGetSessionUser(input: { userId: string }): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.getSessionUser(input))
+  }
+
+  async authGetMe(input: { userId: string }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.getMe(input))
+  }
+
+  async authUpdateProfile(input: { userId: string; displayName: unknown }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.updateProfile(input))
+  }
+
+  async authChangePassword(input: {
+    userId: string
+    currentPassword: unknown
+    newPassword: unknown
+  }): Promise<WakerResult<{ changed: true }>> {
+    return this.#authCall((auth) => auth.changePassword(input))
+  }
+
+  async authTotpSetupStart(input: { userId: string }): Promise<WakerResult<{ secret: string; uri: string }>> {
+    return this.#authCall((auth) => auth.totpSetupStart(input))
+  }
+
+  async authTotpSetupConfirm(input: { userId: string; code: unknown }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.totpSetupConfirm(input))
+  }
+
+  async authTotpDisable(input: { userId: string; password: unknown }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.totpDisable(input))
+  }
+
+  async authEmailOtpSetupSend(input: { userId: string }): Promise<WakerResult<OneTimeCodeView>> {
+    return this.#authCall((auth) => auth.emailOtpSetupSend(input))
+  }
+
+  async authEmailOtpEnable(input: { userId: string; code: unknown }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.emailOtpEnable(input))
+  }
+
+  async authEmailOtpDisable(input: { userId: string; password: unknown }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.emailOtpDisable(input))
+  }
+
+  async authPasskeyRegisterOptions(input: {
+    userId: string
+    rpId: unknown
+  }): Promise<WakerResult<WebAuthnOptionsView>> {
+    return this.#authCall((auth) => auth.passkeyRegisterOptions(input))
+  }
+
+  async authPasskeyRegisterVerify(input: {
+    userId: string
+    rpId: unknown
+    origin: unknown
+    response: unknown
+    name: unknown
+  }): Promise<WakerResult<PasskeyView>> {
+    return this.#authCall((auth) => auth.passkeyRegisterVerify(input))
+  }
+
+  async authListPasskeys(input: { userId: string }): Promise<WakerResult<{ passkeys: PasskeyView[] }>> {
+    return this.#authCall((auth) => auth.listPasskeys(input))
+  }
+
+  async authRenamePasskey(input: {
+    userId: string
+    credentialId: string
+    name: unknown
+  }): Promise<WakerResult<{ passkeys: PasskeyView[] }>> {
+    return this.#authCall((auth) => auth.renamePasskey(input))
+  }
+
+  async authDeletePasskey(input: {
+    userId: string
+    credentialId: string
+    password: unknown
+  }): Promise<WakerResult<{ passkeys: PasskeyView[] }>> {
+    return this.#authCall((auth) => auth.deletePasskey(input))
+  }
+
+  async authSetPreferredMethod(input: {
+    userId: string
+    method: TwoFactorMethod
+  }): Promise<WakerResult<MeView>> {
+    return this.#authCall((auth) => auth.setPreferredMethod(input))
+  }
+
+  async authListUsers(): Promise<WakerResult<{ users: UserView[] }>> {
+    return this.#authCall((auth) => auth.listUsers())
+  }
+
+  async authUpdateUser(input: UpdateUserInput): Promise<WakerResult<UserView>> {
+    return this.#authCall((auth) => auth.updateUser(input))
+  }
+
+  async authDeleteUser(input: { actorId: string; userId: string }): Promise<WakerResult<{ deleted: true }>> {
+    return this.#authCall((auth) => auth.deleteUser(input))
+  }
+
+  async authGetSystemSettings(): Promise<WakerResult<SystemSettingsView>> {
+    return this.#authCall((auth) => auth.getSystemSettings())
+  }
+
+  async authSetRegistrationEnabled(input: {
+    actorId: string
+    enabled: boolean
+  }): Promise<WakerResult<SystemSettingsView>> {
+    return this.#authCall((auth) => auth.setRegistrationEnabled(input))
+  }
+
+  async authUpdateEmailSettings(input: {
+    actorId: string
+    settings: UpdateEmailSettingsInput
+  }): Promise<WakerResult<SystemSettingsView>> {
+    return this.#authCall((auth) => auth.updateEmailSettings(input))
+  }
+
+  async authGetEmailSendConfig(): Promise<WakerResult<EmailSendConfig>> {
+    return this.#authCall((auth) => auth.getEmailSendConfig())
   }
 }

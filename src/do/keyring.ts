@@ -96,19 +96,28 @@ export async function signingSecretFingerprint(secret: string): Promise<string> 
  *   - 全程 WebCrypto 原生，不自研 KDF。
  */
 export async function deriveSigningKeyKek(jwtSecret: string): Promise<CryptoKey> {
+  return deriveKek(jwtSecret, KEK_SALT, KEK_INFO, 'signing key')
+}
+
+/**
+ * HKDF-SHA256 → AES-256-GCM 的通用派生（一把密钥只干一件事：salt/info 逐用途独立）。
+ *
+ * `salt` / `info` 是该用途的协议常量（不是密钥），改动等价于换一代信封格式。
+ */
+async function deriveKek(
+  jwtSecret: string,
+  salt: string,
+  info: string,
+  purpose: string,
+): Promise<CryptoKey> {
   if (typeof jwtSecret !== 'string' || jwtSecret.length === 0) {
-    throw new Error('JWT_SECRET 未配置：无法派生 signing key 的加密密钥')
+    throw new Error(`JWT_SECRET 未配置：无法派生 ${purpose} 的加密密钥`)
   }
   const baseKey = await crypto.subtle.importKey('raw', encoder.encode(jwtSecret), 'HKDF', false, [
     'deriveKey',
   ])
   return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: encoder.encode(KEK_SALT),
-      info: encoder.encode(KEK_INFO),
-    },
+    { name: 'HKDF', hash: 'SHA-256', salt: encoder.encode(salt), info: encoder.encode(info) },
     baseKey,
     { name: 'AES-GCM', length: 256 },
     false,
@@ -118,23 +127,18 @@ export async function deriveSigningKeyKek(jwtSecret: string): Promise<CryptoKey>
 
 /** 加密 signing key 明文 → `waker-enc:v1:<iv b64>:<密文 b64>`（IV 12 字节随机）。 */
 export async function encryptSigningSecret(secret: string, kek: CryptoKey): Promise<string> {
+  return encryptEnvelope(secret, kek)
+}
+
+/** 通用信封加密：`waker-enc:v1:<iv b64>:<密文 b64>`（IV 12 字节随机）。 */
+async function encryptEnvelope(plaintext: string, kek: CryptoKey): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12))
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    kek,
-    encoder.encode(secret),
-  )
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, kek, encoder.encode(plaintext))
   return `${SIGNING_SECRET_ENVELOPE_PREFIX}${bytesToBase64(iv)}:${bytesToBase64(new Uint8Array(ciphertext))}`
 }
 
-/**
- * 解密信封；格式不认识或密钥不匹配时返回 null（调用方翻译成
- * `signing_key_unreadable`，不让密文以「明文」身份被拿去签名）。
- */
-export async function decryptSigningSecret(
-  envelope: string,
-  kek: CryptoKey,
-): Promise<string | null> {
+/** 通用信封解密；格式不认识或密钥不匹配返回 null（调用方翻译成自己的错误码）。 */
+async function decryptEnvelope(envelope: string, kek: CryptoKey): Promise<string | null> {
   if (!envelope.startsWith(SIGNING_SECRET_ENVELOPE_PREFIX)) return null
   const body = envelope.slice(SIGNING_SECRET_ENVELOPE_PREFIX.length)
   const separator = body.indexOf(':')
@@ -147,9 +151,99 @@ export async function decryptSigningSecret(
     const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, kek, ciphertext)
     return new TextDecoder().decode(plaintext)
   } catch {
-    // GCM 认证失败（换过 JWT_SECRET / 密文被改动）：一律视为不可读，不区分原因。
     return null
   }
+}
+
+/**
+ * 解密信封；格式不认识或密钥不匹配时返回 null（调用方翻译成
+ * `signing_key_unreadable`，不让密文以「明文」身份被拿去签名）。
+ */
+export async function decryptSigningSecret(
+  envelope: string,
+  kek: CryptoKey,
+): Promise<string | null> {
+  // GCM 认证失败（换过 JWT_SECRET / 密文被改动）：一律视为不可读，不区分原因。
+  return decryptEnvelope(envelope, kek)
+}
+
+// ─────────────────────── ONE-462：TOTP / 邮件凭据的信封（独立 KEK） ───────────────────────
+
+/**
+ * TOTP secret 的 KEK：与 signing key **同一派生源（JWT_SECRET）、独立 salt/info 常量**。
+ * 一把派生钥只干一件事（SPEC §0 / §7）。
+ */
+const TOTP_KEK_SALT = 'waker/totp/kek/v1'
+const TOTP_KEK_INFO = 'waker:totp:aes-256-gcm:v1'
+
+/** 邮件配置里的密码 / API Key 的 KEK：同样独立 salt/info。 */
+const EMAIL_KEK_SALT = 'waker/email/kek/v1'
+const EMAIL_KEK_INFO = 'waker:email:aes-256-gcm:v1'
+
+export function deriveTotpKek(jwtSecret: string): Promise<CryptoKey> {
+  return deriveKek(jwtSecret, TOTP_KEK_SALT, TOTP_KEK_INFO, 'TOTP secret')
+}
+
+export function encryptTotpSecret(secret: string, kek: CryptoKey): Promise<string> {
+  return encryptEnvelope(secret, kek)
+}
+
+export function decryptTotpSecret(envelope: string, kek: CryptoKey): Promise<string | null> {
+  return decryptEnvelope(envelope, kek)
+}
+
+export function deriveEmailKek(jwtSecret: string): Promise<CryptoKey> {
+  return deriveKek(jwtSecret, EMAIL_KEK_SALT, EMAIL_KEK_INFO, '邮件凭据')
+}
+
+export function encryptEmailSecret(secret: string, kek: CryptoKey): Promise<string> {
+  return encryptEnvelope(secret, kek)
+}
+
+export function decryptEmailSecret(envelope: string, kek: CryptoKey): Promise<string | null> {
+  return decryptEnvelope(envelope, kek)
+}
+
+/**
+ * 一次性码 / TOTP 防重放标记的哈希用 pepper：由 `JWT_SECRET` 经 HKDF 独立派生，
+ * 让「拿到库也离线爆破不出 6 位码」（裸 sha256 可被 10^6 枚举穷尽）。
+ */
+const OTP_PEPPER_SALT = 'waker/auth-challenge/pepper/v1'
+const OTP_PEPPER_INFO = 'waker:auth-challenge:hmac-sha256:v1'
+
+export async function deriveOtpPepper(jwtSecret: string): Promise<CryptoKey> {
+  if (typeof jwtSecret !== 'string' || jwtSecret.length === 0) {
+    throw new Error('JWT_SECRET 未配置：无法派生一次性码的哈希密钥')
+  }
+  const baseKey = await crypto.subtle.importKey('raw', encoder.encode(jwtSecret), 'HKDF', false, [
+    'deriveKey',
+  ])
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: encoder.encode(OTP_PEPPER_SALT),
+      info: encoder.encode(OTP_PEPPER_INFO),
+    },
+    baseKey,
+    { name: 'HMAC', hash: 'SHA-256', length: 256 },
+    false,
+    ['sign'],
+  )
+}
+
+/** 一次性码的落库形态：`HMAC-SHA256(pepper, scope)` 的 hex（禁止明文落库）。 */
+export async function hashOneTimeCode(pepper: CryptoKey, scope: string): Promise<string> {
+  const signature = await crypto.subtle.sign('HMAC', pepper, encoder.encode(scope))
+  const bytes = new Uint8Array(signature)
+  let out = ''
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0')
+  return out
+}
+
+/** 不透明一次性令牌（bootstrap / 临时会话）明文：32 字节随机 hex。 */
+export function generateOpaqueToken(): string {
+  return randomHex(32)
 }
 
 /** 信封是否是本模块产出的密文（迁移期的老明文数据判定用）。 */

@@ -151,6 +151,59 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE signing_keys ADD COLUMN algorithm TEXT NOT NULL DEFAULT 'HMAC-SHA256';
     `,
   },
+  {
+    version: 4,
+    sql: `
+      -- ── 用户体系补遗（ONE-462 / AUTH-MULTIUSER-SPEC v1.0 §2）：只追加，不改 v1–v3 ──
+
+      -- 用户：email 一律小写规范化后入库（应用层强制，唯一索引兜底防重复注册）。
+      -- password_hash 是 PBKDF2-SHA256(100k) 的 saltHex:hashHex（对齐 eNotify core/auth）。
+      CREATE TABLE users (
+        id            TEXT    PRIMARY KEY,
+        email         TEXT    NOT NULL UNIQUE,
+        password_hash TEXT    NOT NULL,
+        display_name  TEXT    NOT NULL DEFAULT '',
+        role          TEXT    NOT NULL CHECK (role IN ('admin', 'viewer')),
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_at    INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        last_login_at INTEGER
+      );
+      CREATE UNIQUE INDEX users_email ON users (email);
+
+      -- 每用户 2FA 配置（一人一行，未配置时不存在该行）。
+      -- totp_secret 是密文信封（waker-enc:v1:，KEK 由 JWT_SECRET 经 HKDF 派生、salt/info 独立），
+      -- 未配置为 NULL；passkey_credentials 形状对齐 eNotify：[{id, publicKey, counter, name, createdAt}]。
+      CREATE TABLE user_2fa (
+        user_id            TEXT    PRIMARY KEY,
+        totp_secret        TEXT,
+        totp_enabled       INTEGER NOT NULL DEFAULT 0,
+        passkey_credentials TEXT   NOT NULL DEFAULT '[]',
+        passkey_enabled    INTEGER NOT NULL DEFAULT 0,
+        email_otp_enabled  INTEGER NOT NULL DEFAULT 0,
+        preferred_method   TEXT,
+        updated_at         INTEGER NOT NULL
+      );
+
+      -- 一次性状态（替代 eNotify 的 KV 用法）：code_hash 只存哈希，禁止明文落库。
+      --   email_otp   ：登录/启用邮件 OTP 的 6 位码（HMAC-SHA256 哈希，验后写 consumed_at）
+      --   totp_used   ：TOTP 防重放（码用过即记，expires_at = now + 90s）
+      --   totp_setup  ：绑定暂存（code_hash 存 TOTP secret 的密文信封，10 分钟有效）
+      -- 过期/已消费行由 watchdog tick 顺带清理（src/do/auth-store.ts pruneAuthChallenges）。
+      CREATE TABLE auth_challenges (
+        id          TEXT    PRIMARY KEY,
+        user_id     TEXT    NOT NULL,
+        kind        TEXT    NOT NULL CHECK (kind IN ('email_otp', 'totp_used', 'totp_setup')),
+        session_ref TEXT,
+        code_hash   TEXT    NOT NULL,
+        expires_at  INTEGER NOT NULL,
+        consumed_at INTEGER,
+        created_at  INTEGER NOT NULL
+      );
+      CREATE INDEX auth_challenges_lookup ON auth_challenges (user_id, kind, session_ref);
+      CREATE INDEX auth_challenges_expiry ON auth_challenges (expires_at);
+    `,
+  },
 ]
 
 /** 当前代码期望的 schema 版本。 */

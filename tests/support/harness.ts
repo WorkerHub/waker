@@ -42,6 +42,10 @@ const INSTANCE_NAME = 'waker'
 export const TEST_SETUP_SECRET = 'test-setup-secret-placeholder'
 export const TEST_JWT_SECRET = 'test-jwt-secret-placeholder'
 
+/** 用例里建的第一个管理员（初始化流程会用它走一遍 bootstrap）。 */
+export const TEST_ADMIN_EMAIL = 'admin@waker.test'
+export const TEST_ADMIN_PASSWORD = 'admin-password-123'
+
 /** 冻结 RPC 契约（测试侧独立声明，B2 用法一致）。 */
 export interface WakerRpcContract {
   createJob(input: CreateJobInput): Promise<WakerResult<JobView>>
@@ -302,17 +306,65 @@ export async function http<T = unknown>(
   return { status: response.status, body: parsed as T }
 }
 
-/** 管理面会话：用 SETUP_SECRET 换 JWT（每个测试文件换一次即可）。 */
-export async function managementToken(ctx: TestContext): Promise<string> {
-  const result = await http<{ session: { token: string; expiresAt: number } }>(
-    ctx,
-    '/api/auth/setup',
-    { method: 'POST', body: { setupSecret: TEST_SETUP_SECRET } },
-  )
+/**
+ * 初始化 + 首个管理员 + 登录，拿一枚 12 小时会话 JWT。
+ *
+ * ONE-462 起 `SETUP_SECRET` 只能换一次性 bootstrap 令牌，**不再换会话**（SPEC §3 / §5.2），
+ * 所以测试也照线上真实路径走一遍：`POST /api/setup` → `POST /api/setup/admin`。
+ * 已有管理员时直接登录（幂等，供同一文件里多次调用）。
+ */
+export async function loginAs(
+  ctx: TestContext,
+  email: string = TEST_ADMIN_EMAIL,
+  password: string = TEST_ADMIN_PASSWORD,
+): Promise<string> {
+  const result = await http<{ session: { token: string; expiresAt: number } }>(ctx, '/api/auth/login', {
+    method: 'POST',
+    body: { email, password },
+  })
   if (result.status !== 200) {
-    throw new Error(`换管理面会话失败（${result.status}）：${JSON.stringify(result.body)}`)
+    throw new Error(`登录失败（${result.status}）：${JSON.stringify(result.body)}`)
   }
   return result.body.session.token
+}
+
+/** 初始化并建首个管理员（幂等：已初始化则直接登录）。 */
+export async function bootstrapAdmin(ctx: TestContext): Promise<string> {
+  const state = await http<{ initialized: boolean }>(ctx, '/api/setup/state')
+  if (state.body.initialized) return loginAs(ctx)
+
+  const setup = await http<{ bootstrapToken: string }>(ctx, '/api/setup', {
+    method: 'POST',
+    body: { setupSecret: TEST_SETUP_SECRET },
+    headers: { 'cf-connecting-ip': '10.0.0.1' },
+  })
+  if (setup.status !== 200) {
+    throw new Error(`初始化失败（${setup.status}）：${JSON.stringify(setup.body)}`)
+  }
+
+  const created = await http<{ session: { token: string } }>(ctx, '/api/setup/admin', {
+    method: 'POST',
+    body: {
+      bootstrapToken: setup.body.bootstrapToken,
+      email: TEST_ADMIN_EMAIL,
+      password: TEST_ADMIN_PASSWORD,
+      displayName: '管理员',
+    },
+    headers: { 'cf-connecting-ip': '10.0.0.1' },
+  })
+  if (created.status !== 201) {
+    throw new Error(`建首个管理员失败（${created.status}）：${JSON.stringify(created.body)}`)
+  }
+  return created.body.session.token
+}
+
+/** 管理面会话（每个测试文件换一次，结果缓存在 ctx 上）。 */
+export async function managementToken(ctx: TestContext): Promise<string> {
+  const holder = ctx as TestContext & { __managementToken?: string }
+  if (holder.__managementToken === undefined) {
+    holder.__managementToken = await bootstrapAdmin(ctx)
+  }
+  return holder.__managementToken
 }
 
 /** 建任务（走真实 RPC）。 */

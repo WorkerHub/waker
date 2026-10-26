@@ -152,19 +152,30 @@ function cronJob(overrides: Partial<CreateJobInput> = {}): CreateJobInput {
 }
 
 describe('数据模型：DO 启动即建好 SQLite 表', () => {
-  it('五张表齐全且 schema 版本已写入', async () => {
+  it('v1–v4 的表齐全且 schema 版本已写入', async () => {
     const tables = await sql.exec(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
     const names = tables.map((row) => row.name as string)
 
-    for (const table of ['dead_letters', 'executions', 'jobs', 'projects', 'signing_keys']) {
+    for (const table of [
+      'dead_letters',
+      'executions',
+      'jobs',
+      'projects',
+      'signing_keys',
+      // v4（ONE-462 用户体系补遗）
+      'users',
+      'user_2fa',
+      'auth_challenges',
+    ]) {
       expect(names).toContain(table)
     }
 
     // 版本账本在 waker_meta 里（DO 的 SQLite 不允许读写 PRAGMA user_version）
     // v2 = B3 追加（projects.callback_url + executions.signing_key_id/renewal_at/renewal_error）。
     // v3 = B4 追加（projects.token_rotated_at + signing_keys.fingerprint/algorithm）。
+    // v4 = ONE-462 追加（users / user_2fa / auth_challenges，用户体系与 2FA）。
     const version = await sql.exec(`SELECT value FROM waker_meta WHERE key = 'schema_version'`)
-    expect(Number(version[0]!.value)).toBe(3)
+    expect(Number(version[0]!.value)).toBe(4)
   })
 })
 

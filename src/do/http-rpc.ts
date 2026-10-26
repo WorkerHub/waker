@@ -1,6 +1,21 @@
 import type { Env } from '../env'
 import { getWakerStub } from './instance'
 import type {
+  BootstrapTokenView,
+  EmailSendConfig,
+  MeView,
+  OneTimeCodeView,
+  PasskeyView,
+  PasswordLoginView,
+  SetupStateView,
+  SystemSettingsView,
+  TwoFactorMethod,
+  UpdateEmailSettingsInput,
+  UpdateUserInput,
+  UserView,
+  WebAuthnOptionsView,
+} from './auth-types'
+import type {
   CreateJobInput,
   CreateProjectInput,
   CreateProjectResult,
@@ -70,6 +85,94 @@ export interface WakerApiRpc {
   verifyProjectToken(input: VerifyProjectTokenInput): Promise<WakerResult<ProjectAuthView | null>>
   // 只读状态
   getSystemStatus(): Promise<WakerResult<SystemStatusView>>
+
+  // ── 用户体系 / 2FA / 邮件配置（ONE-462） ──
+  authSetupState(): Promise<WakerResult<SetupStateView>>
+  authBeginSetup(input: { setupSecret: unknown; ip: string }): Promise<WakerResult<BootstrapTokenView>>
+  authCreateFirstAdmin(input: {
+    bootstrapToken: unknown
+    email: unknown
+    password: unknown
+    displayName: unknown
+  }): Promise<WakerResult<UserView>>
+  authRegister(input: {
+    email: unknown
+    password: unknown
+    displayName: unknown
+    ip: string
+  }): Promise<WakerResult<UserView>>
+  authBeginLogin(input: {
+    email: unknown
+    password: unknown
+    ip: string
+  }): Promise<WakerResult<PasswordLoginView>>
+  authVerifyTotp(input: { sessionRef: unknown; code: unknown }): Promise<WakerResult<UserView>>
+  authVerifyEmailOtp(input: { sessionRef: unknown; code: unknown }): Promise<WakerResult<UserView>>
+  authSendLoginEmailOtp(input: { sessionRef: unknown }): Promise<WakerResult<OneTimeCodeView>>
+  authDiscardChallenge(input: { challengeId: unknown }): Promise<WakerResult<{ discarded: boolean }>>
+  authPasskeyLoginOptions(input: {
+    sessionRef: unknown
+    rpId: unknown
+  }): Promise<WakerResult<WebAuthnOptionsView>>
+  authPasskeyLoginVerify(input: {
+    sessionRef: unknown
+    rpId: unknown
+    origin: unknown
+    response: unknown
+  }): Promise<WakerResult<UserView>>
+  authGetSessionUser(input: { userId: string }): Promise<WakerResult<UserView>>
+  authGetMe(input: { userId: string }): Promise<WakerResult<MeView>>
+  authUpdateProfile(input: { userId: string; displayName: unknown }): Promise<WakerResult<MeView>>
+  authChangePassword(input: {
+    userId: string
+    currentPassword: unknown
+    newPassword: unknown
+  }): Promise<WakerResult<{ changed: true }>>
+  authTotpSetupStart(input: { userId: string }): Promise<WakerResult<{ secret: string; uri: string }>>
+  authTotpSetupConfirm(input: { userId: string; code: unknown }): Promise<WakerResult<MeView>>
+  authTotpDisable(input: { userId: string; password: unknown }): Promise<WakerResult<MeView>>
+  authEmailOtpSetupSend(input: { userId: string }): Promise<WakerResult<OneTimeCodeView>>
+  authEmailOtpEnable(input: { userId: string; code: unknown }): Promise<WakerResult<MeView>>
+  authEmailOtpDisable(input: { userId: string; password: unknown }): Promise<WakerResult<MeView>>
+  authPasskeyRegisterOptions(input: {
+    userId: string
+    rpId: unknown
+  }): Promise<WakerResult<WebAuthnOptionsView>>
+  authPasskeyRegisterVerify(input: {
+    userId: string
+    rpId: unknown
+    origin: unknown
+    response: unknown
+    name: unknown
+  }): Promise<WakerResult<PasskeyView>>
+  authListPasskeys(input: { userId: string }): Promise<WakerResult<{ passkeys: PasskeyView[] }>>
+  authRenamePasskey(input: {
+    userId: string
+    credentialId: string
+    name: unknown
+  }): Promise<WakerResult<{ passkeys: PasskeyView[] }>>
+  authDeletePasskey(input: {
+    userId: string
+    credentialId: string
+    password: unknown
+  }): Promise<WakerResult<{ passkeys: PasskeyView[] }>>
+  authSetPreferredMethod(input: {
+    userId: string
+    method: TwoFactorMethod
+  }): Promise<WakerResult<MeView>>
+  authListUsers(): Promise<WakerResult<{ users: UserView[] }>>
+  authUpdateUser(input: UpdateUserInput): Promise<WakerResult<UserView>>
+  authDeleteUser(input: { actorId: string; userId: string }): Promise<WakerResult<{ deleted: true }>>
+  authGetSystemSettings(): Promise<WakerResult<SystemSettingsView>>
+  authSetRegistrationEnabled(input: {
+    actorId: string
+    enabled: boolean
+  }): Promise<WakerResult<SystemSettingsView>>
+  authUpdateEmailSettings(input: {
+    actorId: string
+    settings: UpdateEmailSettingsInput
+  }): Promise<WakerResult<SystemSettingsView>>
+  authGetEmailSendConfig(): Promise<WakerResult<EmailSendConfig>>
 }
 
 /** 编译期断言：WakerDO 满足 HTTP 面用到的 RPC 契约。 */
