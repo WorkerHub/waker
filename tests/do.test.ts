@@ -658,11 +658,14 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
 
 describe('watchdog（唯一 Cron Trigger）→ DO alarm 自愈', () => {
   it('watchdog 补处理停机期间到期的任务并重设 alarm', async () => {
+    // 用跨年 cron + 固定锚点回拨，避免「最近槽位正好落在 60s 容差内」导致期望次数抖动
     const job = unwrapResult(
-      await stub.createJob(cronJob({ cron: '*/5 * * * *', policies: { misfire: 'fire_once' } })),
+      await stub.createJob(cronJob({ cron: YEARLY_CRON, policies: { misfire: 'fire_all' } })),
     )
 
-    await backdateNextRunAt(job.id, job.nextRunAt! - 10 * 60_000)
+    await backdateNextRunAt(job.id, YEARLY_ANCHOR)
+    const expected = yearlySlotsUntilNow()
+    expect(expected.length).toBeGreaterThanOrEqual(2)
 
     const scheduled = await worker.scheduled({
       cron: '0 * * * *',
@@ -672,8 +675,9 @@ describe('watchdog（唯一 Cron Trigger）→ DO alarm 自愈', () => {
     expect(scheduled.outcome).toBe('ok')
 
     const rows = await executionsOf(job.id)
-    expect(rows).toHaveLength(1)
-    expect(rows[0]!.trigger).toBe('schedule')
+    expect(rows.length).toBeGreaterThanOrEqual(expected.length)
+    expect(rows.slice(0, expected.length).map((row) => row.scheduled_for)).toEqual(expected)
+    expect(rows.every((row) => row.trigger === 'schedule')).toBe(true)
 
     const refreshed = unwrapResult(await stub.getJob({ jobId: job.id }))
     expect(refreshed!.nextRunAt!).toBeGreaterThan(Date.now())
