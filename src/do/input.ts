@@ -57,6 +57,17 @@ export function resolveTimezone(value: string | undefined): string {
   return timezone
 }
 
+/** 非负整数（用于 attempt / 重试次数一类计数）：负数、小数、NaN 均报 `invalid_argument`。 */
+export function requireNonNegativeInt(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new WakerError('invalid_argument', `${field} 必须是整数`)
+  }
+  if (value < 0) {
+    throw new WakerError('invalid_argument', `${field} 不能为负数`)
+  }
+  return value
+}
+
 export function toEpochMs(value: unknown): number {
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new WakerError('invalid_run_at', 'runAt 必须是有限数字（epoch 毫秒）')
