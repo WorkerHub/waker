@@ -1,0 +1,33 @@
+# 参考接入示例 —— **模式二：接入 waker（平台回调）**
+#
+# 与 wrangler.cron.toml 的差别只有三处：
+#   1. **删掉 [triggers]**：不再占账号级 Cron Trigger 槽，调度交给平台；
+#   2. 打开 WAKER_MODE=waker + 注入平台地址 WAKER_URL（代码侧自动挂载 /_waker 回调）；
+#   3. 注入两个 secret（只经 `wrangler secret put`，绝不写进本文件）：
+#        WAKER_TOKEN        项目令牌（调注册 API：清单同步 / one-shot 创建与取消）
+#        WAKER_SIGNING_KEY  项目 signing key（回调验签；建项目时一次性展示的那把）
+#
+# 部署：
+#   wrangler deploy -c examples/reference-worker/wrangler.waker.toml
+#   wrangler secret put WAKER_TOKEN       -c examples/reference-worker/wrangler.waker.toml
+#   wrangler secret put WAKER_SIGNING_KEY -c examples/reference-worker/wrangler.waker.toml
+#
+# 切回模式一只要换配置文件，业务代码（src/jobs.ts）一个字都不用改。
+
+name = "waker-reference-worker"
+main = "src/index.ts"
+compatibility_date = "2026-10-26"
+workers_dev = true
+
+[vars]
+WAKER_MODE = "waker"
+# 平台根地址（管理面「项目管理」里建项目时填的回调地址是**本 Worker** 的地址）。
+WAKER_URL = "https://waker.oneboy.app"
+
+# 幂等账本用下游自己的 D1（平台真源在 WakerDO，两者无关）。
+# 表结构见 migrations/0001_waker_executions.sql（由 SDK 的 executionLedgerDdl() 生成）。
+[[d1_databases]]
+binding = "WAKER_DB"
+database_name = "waker-reference"
+database_id = "<你的 D1 数据库 id>"
+migrations_dir = "migrations"

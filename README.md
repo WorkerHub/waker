@@ -6,10 +6,10 @@
 - 域名：`waker.oneboy.app`
 - 规格：父单 ONE-373 内嵌 SPEC.md v1.0（唯一规格源）
 
-> 当前状态：**调度内核 + 执行引擎已就位（B1 + B2 + B3）**。WakerDO 的 SQLite 数据模型、任务生命周期 RPC、
-> alarm 自愈、CF 方言 cron 解析器，以及 Queue 分发 → 同步回调（HMAC 签名）→ 重试/死信 → 自续的整条执行链路
-> 已完成并有测试覆盖；注册 API 与凭据（B4）、执行记录 / 死信查询 RPC（B6）、管理面与前端（F1-F3）、
-> SDK（B5）仍为后续子单。
+> 当前状态：**平台后端 B1-B6 已就位**。WakerDO 的 SQLite 数据模型、任务生命周期 RPC、alarm 自愈、
+> CF 方言 cron 解析器，Queue 分发 → 同步回调（HMAC 签名）→ 重试/死信 → 自续的整条执行链路，
+> 注册 API 与凭据（B4）、执行记录 / 死信查询 RPC（B6），以及**客户端 SDK + 参考接入示例（B5，双模式可选接入）**
+> 都已落地并有测试覆盖；管理面前端（F1-F3）仍为后续子单。
 
 ## 架构（骨架已定型）
 
@@ -71,6 +71,13 @@ src/cron/schedule.ts    croner 封装（alternativeWeekdays / 时区 / 下次执
 src/queue/consumer.ts   Queue consumer：主队列（同步回调）/ 死信队列（转存死信表）
 src/queue/backoff.ts    重试退避 → Queue delaySeconds 折算（纯逻辑）
 src/env.ts              绑定与密钥的类型声明
+client/src/protocol.ts  回调协议 v2 的 SDK 侧副本（与 src/callback/protocol.ts 逐项对齐，测试断言）
+client/src/verify.ts    HMAC 验签 helper（WebCrypto，时间窗防重放）
+client/src/ledger.ts    executionId 幂等账本（D1 / 内存两种实现 + 建表 SQL）
+client/src/receiver.ts  createWakerReceiver / mountWakerReceiver（Hono 挂载 /_waker）
+client/src/client.ts    注册客户端：whoami / 清单对账 / one-shot 创建与取消
+client/src/modes.ts     双模式判定（WAKER_MODE，缺省 cron）
+examples/reference-worker/  参考接入示例：同一份任务逻辑 + 两套 wrangler 配置（原生 / waker）
 scripts/check-single-cron.mjs  硬约束守卫（Cron 数量 / 禁 D1·KV）
 scripts/ci/gen-secrets-file.sh 密钥管线（逐键非空 → secrets.json 0600）
 .github/workflows/ci.yml        CI：typecheck / lint / 守卫 / test / build
@@ -280,6 +287,33 @@ cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 
 B6 的 `listExecutions` / `listDeadLetters` 查询 RPC 已就位并有测试覆盖，HTTP 路由由后续管理面单挂载
 （本单范围只有 DO 查询 RPC，不动管理面路由）。
 
+## 客户端 SDK（B5，`client/`）
+
+下游接入用的源码 SDK，零额外依赖（唯一 peer 是 `hono`），**对齐三份冻结契约**：回调协议 v2（B3）、
+注册 API（B4）、CF Cron Triggers 方言（B2，`cron` 字符串原样透传、不改写）。
+`tests/client.test.ts` 把 SDK 的常量 / 头名 / 签名规范串 / 请求响应结构与平台实现逐项比对，漂移即红。
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| 回调接收 | `createWakerReceiver({ jobs })` / `mountWakerReceiver(app, { env, jobs })` | Hono 子应用挂到 `/_waker`，`POST /execute` 同步执行、2xx = 成功 |
+| 验签 | `verifyWakerSignature(...)` | HMAC-SHA256 覆盖 `timestamp + executionId + jobId + rawBody`，300s 时间窗 |
+| 幂等 | `createD1ExecutionLedger` / `createMemoryExecutionLedger` / `executionLedgerDdl()` | `executionId` 原子认领，重复投递回 2xx + 首响应回放；业务失败释放占位 |
+| 注册 / one-shot | `createWakerClient` / `createWakerClientFromEnv` | `whoami` / `listJobs` / `createJob` / `createOneShot` / `cancelJob` / `syncManifest` |
+| 双模式 | `resolveWakerMode` / `isWakerEnabled` | `WAKER_MODE` 缺省或未知取值一律按 `cron`（可选接入默认关闭） |
+
+**可选接入（双模式）**：原生模式下 receiver 不挂载、注册客户端不构造、`scheduled()` 完全不受影响。
+参考示例（`examples/reference-worker/`）更彻底：SDK 的 `import()` 写在 waker 分支里，
+原生模式下模块**连求值都不发生**；两模式共用同一份 `runJob()` 与同一条 `0 3 * * *` 表达式，
+配置文件只差「删掉 `[triggers]` + `WAKER_MODE=waker` + 注入 `WAKER_URL` 与两个 secret」。
+
+`tests/reference-example.test.ts` 把「注册 → 调度 → 回调 → 自续」整条链路在真 workerd（真 DO / 真 Queue）
+上跑通一次，并断言双模式切换与两份 wrangler 配置的差异（secret 绝不出现在配置文件里）。
+
+> ⚠️ 硬约束守卫（`pnpm check:cron`）语义（B5 收窄示例范围）：**平台本体**仍只允许 1 个 Cron Trigger
+> （watchdog），且平台配置仍禁 D1 / KV；`examples/**` 是下游项目形态的参考示例、不是本仓部署目标，
+> 它演示原生模式时必然带自己的 `[triggers]`，这部分单独统计（只能在 `examples/**` 的 `.toml` 配置里、
+> 每文件最多 1 处），不计入平台预算。
+
 ## 本地开发
 
 ```bash
@@ -294,6 +328,14 @@ DO 集成测试用 wrangler 的 `createTestHarness`（Miniflare → workerd）�
 wrangler.toml：真 DO 绑定、真 SQLite 后端、真 Queue 与真 queue consumer，断言直接查库，不是 mock。
 执行引擎的链路测试（`tests/engine.test.ts`）还会在 `127.0.0.1` 上真起一个下游 HTTP 服务，
 用项目 signing key 从**下游视角**独立验签——所以「签名可用」是被第三方视角证明过的。
+
+B5 的用例：
+
+- `tests/client.test.ts`：SDK 契约对齐、HMAC 验签（正/反/过期/篡改）、receiver 分发与错误码、
+  幂等账本（含过期占位接管）、可选接入（原生模式不挂载、缺 signing key 启动期 fail fast）。
+- `tests/client-api.test.ts`：注册客户端打**真平台**（真令牌鉴权、真注册 API）——
+  `whoami` / `createOneShot` / `cancelJob` / 清单对账幂等 / cron 方言原样透传 / 错误码映射。
+- `tests/reference-example.test.ts`：参考示例全链路（注册 → 调度 → 回调 → 自续）+ 双模式切换。
 
 B4 的用例：
 
@@ -335,4 +377,5 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 | B6 | 查询 RPC：`listExecutions` / `listDeadLetters`（执行记录页 / 死信页） |
 | B3 | 执行引擎：Queue 分发 + 回调协议 v2（HMAC）+ 重试/DLQ + 自续 |
 | B4 | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
-| F1-F3 / B5 | 管理面前端、客户端 SDK |
+| B5 | 客户端 SDK（`client/`）+ 参考接入示例（`examples/reference-worker/`，双模式可选接入） |
+| F1-F3 | 管理面前端（任务 / 执行记录 / 死信三页 + 项目管理 / 设置 / 关于 / 系统管理） |
