@@ -10,6 +10,19 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { setAuthToken } from '@/lib/api'
 import { useSession } from '@/stores/session'
 
+/** 清掉上一个用例留下的会话（store 与 localStorage 都是模块级状态，跨用例会互相污染）。 */
+export function resetSessionState(): void {
+  setAuthToken(null)
+  if (typeof localStorage !== 'undefined') localStorage.clear()
+  useSession.setState({
+    session: null,
+    user: null,
+    challenge: null,
+    error: null,
+    pending: false,
+  })
+}
+
 /** 测试用会话：同时把令牌挂到 API client 与 store（与真实登录后的状态一致）。 */
 export const TEST_SESSION_TOKEN = 'test-session-token'
 

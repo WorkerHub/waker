@@ -1,100 +1,186 @@
 import { create } from 'zustand'
 
 import {
-  ApiError,
-  createSession,
-  setAuthToken,
-  setUnauthorizedHandler,
+  describeAuthError,
+  loginWithPassword,
+  type UserView,
   type SessionInfo,
-} from '@/lib/api'
+  type TwoFactorMethod,
+} from '@/lib/auth-api'
+import { setAuthToken, setUnauthorizedHandler } from '@/lib/api'
 
 /**
- * 会话 store：管理面 JWT 只存在浏览器 localStorage（12 小时有效，后端签发）。
+ * 会话 store（SPEC §5.2）：管理面 JWT 只存在浏览器 localStorage（12 小时有效，后端签发）。
  *
- * 为什么是 localStorage 而不是内存：刷新页面不该要求重新输入 SETUP_SECRET；
- * 令牌本身是短期 JWT，且后端不提供 refresh —— 过期即回登录页，语义简单可预期。
- * 注意：这里**只**保存会话令牌，signing key / 项目令牌明文一律不落任何存储。
+ * 保存三样东西，边界各不相同：
+ *   - `session`：正式会话 `{ token, expiresAt }`，刷新页面不该要求重新登录，因此落 localStorage；
+ *   - `user`：当前用户视图（角色 / 显示名 / 邮箱），落 localStorage 只为首屏就能按角色裁剪入口 ——
+ *     **权限判定永远在后端**（viewer 的写请求照样 403），这里只是不给无权限的按钮；
+ *   - `challenge`：两步登录的临时令牌（≤5 分钟、仅限 2FA 步）**只在内存**，
+ *     一旦离开 2FA 页 / 刷新就重新走密码步 —— 临时令牌不落任何存储。
+ *
+ * bootstrap 令牌同理不落存储：它只活在 `/setup` 页面的组件状态里。
  */
-const STORAGE_KEY = 'waker.session.v1'
+const STORAGE_KEY = 'waker.session.v2'
+
+/** 两步登录待办（密码步已通过、还差第二因素）。 */
+export interface LoginChallenge {
+  tempToken: string
+  /** 临时令牌过期时刻（epoch ms）。 */
+  expiresAt: number
+  /** 可用方法，后端已按 preferred 优先排序，前端不重排。 */
+  methods: TwoFactorMethod[]
+  user: UserView
+}
+
+/** 密码步结果：直接登录 / 需要第二步 / 失败（错误已在 `error` 里）。 */
+export type LoginStep = 'session' | 'two_factor' | 'failed'
+
+interface Persisted {
+  session: SessionInfo
+  user: UserView | null
+}
 
 interface SessionState {
   session: SessionInfo | null
-  /** 换会话失败时的错误（登录页展示），null = 无错误。 */
+  user: UserView | null
+  challenge: LoginChallenge | null
+  /** 面向用户的错误提示（登录 / 2FA 页展示），null = 无错误。 */
   error: string | null
   pending: boolean
-  login: (setupSecret: string) => Promise<boolean>
-  logout: () => void
+
+  login: (email: string, password: string) => Promise<LoginStep>
+  /** 注册 / 建首管 / 2FA 通过后统一收口：写令牌 + 用户，落存储。 */
+  adopt: (result: { user: UserView; session: SessionInfo }) => void
+  setUser: (user: UserView) => void
+  setChallenge: (challenge: LoginChallenge) => void
+  clearChallenge: () => void
+  setPending: (pending: boolean) => void
+  setError: (message: string | null) => void
   clearError: () => void
+  logout: () => void
 }
 
-function readStoredSession(): SessionInfo | null {
+function readPersisted(): Persisted | null {
   if (typeof localStorage === 'undefined') return null
   const raw = localStorage.getItem(STORAGE_KEY)
   if (raw === null) return null
   try {
-    const parsed = JSON.parse(raw) as Partial<SessionInfo>
-    if (typeof parsed.token !== 'string' || typeof parsed.expiresAt !== 'number') return null
-    if (parsed.expiresAt <= Date.now()) {
+    const parsed = JSON.parse(raw) as Partial<Persisted>
+    const session = parsed.session
+    if (
+      session === undefined ||
+      typeof session.token !== 'string' ||
+      typeof session.expiresAt !== 'number'
+    ) {
       localStorage.removeItem(STORAGE_KEY)
       return null
     }
-    return { token: parsed.token, expiresAt: parsed.expiresAt }
+    if (session.expiresAt <= Date.now()) {
+      localStorage.removeItem(STORAGE_KEY)
+      return null
+    }
+    return { session, user: parsed.user ?? null }
   } catch {
     localStorage.removeItem(STORAGE_KEY)
     return null
   }
 }
 
-function writeStoredSession(session: SessionInfo | null): void {
+function writePersisted(value: Persisted | null): void {
   if (typeof localStorage === 'undefined') return
-  if (session === null) localStorage.removeItem(STORAGE_KEY)
-  else localStorage.setItem(STORAGE_KEY, JSON.stringify(session))
+  if (value === null) localStorage.removeItem(STORAGE_KEY)
+  else localStorage.setItem(STORAGE_KEY, JSON.stringify(value))
 }
 
-const initialSession = readStoredSession()
+const initial = readPersisted()
 // 首个请求之前就把令牌挂到 client 上（避免首屏查询漏带 Authorization）。
-setAuthToken(initialSession?.token ?? null)
+setAuthToken(initial?.session.token ?? null)
 
-export const useSession = create<SessionState>((set) => ({
-  session: initialSession,
+export const useSession = create<SessionState>((set, get) => ({
+  session: initial?.session ?? null,
+  user: initial?.user ?? null,
+  challenge: null,
   error: null,
   pending: false,
 
-  async login(setupSecret: string) {
+  async login(email, password) {
     set({ pending: true, error: null })
     try {
-      const session = await createSession(setupSecret)
-      setAuthToken(session.token)
-      writeStoredSession(session)
-      set({ session, pending: false })
-      return true
+      const result = await loginWithPassword(email, password)
+      if (result.requiresTwoFactor) {
+        // 临时令牌只在内存：它就是「第二因素待办」的唯一凭据。
+        set({
+          pending: false,
+          error: null,
+          challenge: {
+            tempToken: result.tempToken,
+            expiresAt: result.expiresAt,
+            methods: result.methods,
+            user: result.user,
+          },
+        })
+        return 'two_factor'
+      }
+
+      setAuthToken(result.session.token)
+      writePersisted({ session: result.session, user: result.user })
+      set({ session: result.session, user: result.user, challenge: null, pending: false, error: null })
+      return 'session'
     } catch (error) {
-      const message =
-        error instanceof ApiError
-          ? error.code === 'unauthorized'
-            ? 'SETUP_SECRET 不正确'
-            : error.message
-          : error instanceof Error
-            ? error.message
-            : '登录失败'
-      set({ pending: false, error: message })
-      return false
+      set({ pending: false, error: describeAuthError(error) })
+      return 'failed'
     }
   },
 
-  logout() {
-    setAuthToken(null)
-    writeStoredSession(null)
-    set({ session: null, error: null })
+  adopt(result) {
+    setAuthToken(result.session.token)
+    writePersisted({ session: result.session, user: result.user })
+    set({
+      session: result.session,
+      user: result.user,
+      challenge: null,
+      pending: false,
+      error: null,
+    })
+  },
+
+  setUser(user) {
+    const session = get().session
+    if (session !== null) writePersisted({ session, user })
+    set({ user })
+  },
+
+  setChallenge(challenge) {
+    set({ challenge, error: null })
+  },
+
+  clearChallenge() {
+    set({ challenge: null })
+  },
+
+  setPending(pending) {
+    set({ pending })
+  },
+
+  setError(message) {
+    set({ error: message })
   },
 
   clearError() {
     set({ error: null })
   },
+
+  logout() {
+    setAuthToken(null)
+    writePersisted(null)
+    set({ session: null, user: null, challenge: null, error: null })
+  },
 }))
 
-// 任何带令牌的请求收到 401（会话过期 / 被换掉）→ 清会话回登录页。
+// 任何带令牌的请求收到 401（会话过期 / 被换掉 / 账号被禁用）→ 清会话回登录页。
+// 公开鉴权路径（登录、2FA、初始化）的 401 由 `lib/api.ts` 排除，不会走到这里。
 setUnauthorizedHandler(() => {
-  writeStoredSession(null)
-  useSession.setState({ session: null })
+  writePersisted(null)
+  useSession.setState({ session: null, user: null })
 })

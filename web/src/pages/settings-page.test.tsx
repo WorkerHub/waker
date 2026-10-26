@@ -1,21 +1,61 @@
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
-import { SettingsPage } from '@/pages/settings-page'
+import type { MeView } from '@/lib/auth-api'
 import { formatDateTime } from '@/lib/format'
 import { PLATFORM_DOMAIN, PLATFORM_REPO_URL, PLATFORM_VERSION } from '@/lib/platform'
-import { authenticate, installFetchMock, renderWithProviders } from '@/test/utils'
+import { SettingsPage } from '@/pages/settings-page'
+import {
+  authenticate,
+  installFetchMock,
+  renderWithProviders,
+  resetSessionState,
+} from '@/test/utils'
 import { useSession } from '@/stores/session'
 
-/**
- * 设置页 smoke：平台信息（版本 / 域名）与当前会话可加载；
- * 页面纯本地数据（不发任何请求），也不渲染会话令牌。
- */
+function makeMe(overrides: Partial<MeView> = {}): MeView {
+  return {
+    user: {
+      id: 'user-1',
+      email: 'me@example.com',
+      displayName: '我',
+      role: 'admin',
+      isActive: true,
+      createdAt: 1_730_000_000_000,
+      updatedAt: 1_730_000_000_000,
+      lastLoginAt: 1_730_599_000_000,
+    },
+    twoFactor: {
+      totpEnabled: false,
+      emailOtpEnabled: false,
+      passkeyEnabled: false,
+      preferredMethod: null,
+    },
+    availableMethods: [],
+    ...overrides,
+  }
+}
+
 describe('设置页', () => {
-  it('展示平台信息与当前会话，且不发任何请求、不渲染会话令牌', async () => {
-    const fetchMock = installFetchMock(() => {
-      throw new Error('设置页不该发请求')
+  beforeEach(resetSessionState)
+
+  it('展示个人资料、安全区与平台信息，且不渲染会话令牌', async () => {
+    installFetchMock((url) => {
+      if (url === '/api/me') return { body: makeMe() }
+      if (url === '/api/setup/state') {
+        return {
+          body: {
+            schemaVersion: 4,
+            initialized: true,
+            adminExists: true,
+            registrationEnabled: false,
+            emailProvider: 'none',
+          },
+        }
+      }
+      if (url === '/api/me/2fa/passkeys') return { body: { passkeys: [] } }
+      throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
 
@@ -23,6 +63,13 @@ describe('设置页', () => {
     await screen.findByText('平台信息')
 
     expect(screen.getByRole('heading', { level: 1, name: '设置' })).toBeInTheDocument()
+    // 分区：个人资料 / 安全 / 平台信息（安全区独立成段，不塞系统管理）
+    expect(screen.getByText('个人资料')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 2, name: '安全' })).toBeInTheDocument()
+    expect(screen.getByText('身份验证器（TOTP）')).toBeInTheDocument()
+    expect(screen.getAllByText('邮件验证码').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Passkey').length).toBeGreaterThan(0)
+
     // 平台信息是构建期事实：版本来自 __APP_VERSION__（vitest 里注入 'test'）。
     expect(screen.getAllByText(PLATFORM_VERSION).length).toBeGreaterThan(0)
     expect(container.textContent).toContain(PLATFORM_DOMAIN)
@@ -36,23 +83,30 @@ describe('设置页', () => {
     expect(session).not.toBeNull()
     expect(container.textContent).toContain(formatDateTime(session?.expiresAt))
     expect(container.textContent).not.toContain(session?.token ?? '<no-token>')
-
-    expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('没有可写设置项：不出输入框，退出登录只清本地会话', async () => {
-    installFetchMock(() => {
-      throw new Error('设置页不该发请求')
+  it('退出登录只清本地会话', async () => {
+    installFetchMock((url) => {
+      if (url === '/api/me') return { body: makeMe() }
+      if (url === '/api/setup/state') {
+        return {
+          body: {
+            schemaVersion: 4,
+            initialized: true,
+            adminExists: true,
+            registrationEnabled: false,
+            emailProvider: 'none',
+          },
+        }
+      }
+      if (url === '/api/me/2fa/passkeys') return { body: { passkeys: [] } }
+      throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
     const user = userEvent.setup()
 
     renderWithProviders(<SettingsPage />)
-    await screen.findByText('基础设置项')
-
-    // 「按 SPEC 有则做，无则只做展示」：契约里没有可写设置项，页面就不给假开关。
-    expect(screen.queryAllByRole('textbox')).toHaveLength(0)
-    expect(screen.queryByRole('button', { name: /保存/ })).not.toBeInTheDocument()
+    await screen.findByText('平台信息')
 
     await user.click(screen.getByRole('button', { name: /退出登录/ }))
     await waitFor(() => {

@@ -1,13 +1,23 @@
-/** 展示层的纯格式化工具（不含任何调度语义）。 */
+/**
+ * 展示层的纯格式化工具（不含任何调度语义）。
+ *
+ * **时间一律按北京时间（Asia/Shanghai）呈现**：舰队定规要求页面里的时间不随浏览器时区漂移，
+ * 原始 epoch（UTC 毫秒）在渲染时才换算。`formatRelative` 是相对量，与时区无关。
+ */
+const DISPLAY_TIME_ZONE = 'Asia/Shanghai'
 
 const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
   dateStyle: 'medium',
   timeStyle: 'short',
+  timeZone: DISPLAY_TIME_ZONE,
 })
 
-const timeOnlyFormatter = new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium' })
+const timeOnlyFormatter = new Intl.DateTimeFormat('zh-CN', {
+  timeStyle: 'medium',
+  timeZone: DISPLAY_TIME_ZONE,
+})
 
-/** epoch 毫秒 → 本地时区的可读时间；`null` 用 `—` 占位。 */
+/** epoch 毫秒 → 北京时间的可读时间；`null` 用 `—` 占位。 */
 export function formatDateTime(value: number | null | undefined): string {
   if (value === null || value === undefined) return '—'
   return dateTimeFormatter.format(new Date(value))

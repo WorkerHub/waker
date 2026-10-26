@@ -79,11 +79,12 @@ client/src/client.ts    注册客户端：whoami / 清单对账 / one-shot 创�
 client/src/modes.ts     双模式判定（WAKER_MODE，缺省 cron）
 examples/reference-worker/  参考接入示例：同一份任务逻辑 + 两套 wrangler 配置（原生 / waker）
 web/                    管理面前端（Vite + React + shadcn/ui，构建产物由 Worker 静态资源托管）
-web/src/App.tsx         路由表（/login、/jobs、/executions、/dead-letters、/projects）+ 会话守卫
-web/src/pages/          任务管理 / 执行记录 / 死信队列 / 项目管理 / 登录页
-web/src/components/     外壳、一次性凭据对话框、列表分页器、详情分区、任务 / 执行 / 死信 / 项目组件
+web/src/App.tsx         路由表（/setup、/login、/register、/jobs、/executions、/dead-letters、/projects、/system、/settings）+ 会话守卫 + 未初始化闸门
+web/src/pages/          初始化 / 登录（含两步登录第二步）/ 注册 / 任务管理 / 执行记录 / 死信队列 / 项目管理 / 设置 / 系统管理
+web/src/components/     外壳、鉴权表单（OTP 框 / 第二因素步骤）、设置安全区、系统管理卡片、一次性凭据对话框、列表分页器、详情分区
 web/src/components/ui/  shadcn/ui 组件（Nova 风格，registry 原样落库）
 web/src/lib/api.ts      管理面 API client（B2/B3/B4/B6 契约的出入参类型 + 错误码）
+web/src/lib/auth-api.ts 鉴权面 API client（ONE-462 契约：初始化 / 注册 / 两步登录 / 本人设置 / 用户管理 / 邮件配置）
 web/src/lib/executions.ts 执行记录 / 死信的展示层映射（状态标签、耗时、重放入口可见性）
 web/src/stores/         会话 store（zustand）
 scripts/web/sync-shadcn.py  shadcn registry 同步脚本（组件源码唯一来源）scripts/check-single-cron.mjs  硬约束守卫（Cron 数量 / 禁 D1·KV）
@@ -265,7 +266,7 @@ cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/auth/setup` | SETUP_SECRET → 会话 JWT |
+| POST | `/api/auth/setup` | 旧入口：未初始化时退化为 `/api/setup` 的别名（只回 bootstrap 令牌，**不再签发会话**）；已初始化 403 `already_initialized` |
 | GET | `/api/projects` | `{ projects: ProjectView[] }`（只有掩码，无明文） |
 | POST | `/api/projects` | `{ name, callbackUrl }` → 201 `{ project, token, signingKey }`（**明文唯一一次**） |
 | GET | `/api/projects/{id}` | `{ project }` |
@@ -338,9 +339,16 @@ Tailwind v4；图标 Lucide；主题 `next-themes`；服务端状态 `@tanstack/
 
 | 页面 | 路由 | 对着的契约 |
 |---|---|---|
-| 登录 / 首次安装 | `/login` | `POST /api/auth/setup`（`SETUP_SECRET` → 12 小时会话 JWT） |
+| 初始化（SPEC §3） | `/setup` | `GET /api/setup/state`、`POST /api/setup`、`POST /api/setup/admin` |
+| 登录 / 两步验证（§5） | `/login` | `POST /api/auth/login`、`/api/auth/2fa/{verify,otp/send,passkey/options,passkey/verify}` |
+| 注册（§4.2） | `/register` | `GET /api/setup/state`（开关位）、`POST /api/auth/register` |
 | 任务管理 | `/jobs` | `GET/POST /api/jobs`、`PATCH /api/jobs/{id}`、`pause` / `resume` / `cancel` / `trigger` |
 | 项目管理 | `/projects` | `GET/POST /api/projects`、`PATCH /api/projects/{id}`、`token/rotate`、`signing-key/rotate` |
+| 设置 · 个人资料与安全（§5.3） | `/settings` | `GET/PATCH /api/me`、`/api/me/password`、`/api/me/2fa/*`（TOTP / 邮件 OTP / Passkey / preferred） |
+| 系统管理（§4.3 / §6，仅 admin） | `/system` | `GET /api/system/status`（只读）、`/api/users`、`/api/system/settings`（注册开关 / 邮件服务 / 测试邮件） |
+
+未初始化时任意页面都会被引导到 `/setup`（`GET /api/setup/state` 判定）；首个管理员建成后
+`/setup` 只显示「已完成初始化，去登录」，DOM 里不再出现 setup 表单。
 
 契约原则（与 B2/B4 一致，前端不自造字段）：
 

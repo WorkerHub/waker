@@ -2,6 +2,7 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 
+import type { UserView, MeView, SystemSettingsView } from '@/lib/auth-api'
 import type { SystemStatus } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
 import { SystemPage } from '@/pages/system-page'
@@ -9,6 +10,7 @@ import {
   authenticate,
   installFetchMock,
   renderWithProviders,
+  requestBody,
   requestUrl,
   TEST_SESSION_TOKEN,
 } from '@/test/utils'
@@ -39,12 +41,61 @@ function makeStatus(overrides: Partial<SystemStatus> = {}): SystemStatus {
   }
 }
 
-/** 系统管理页 smoke：状态位展示（watchdog / 存储 / 队列 / 密钥配置），只读且不含任何密钥值。 */
-describe('系统管理页', () => {
+function makeUser(overrides: Partial<UserView> = {}): UserView {
+  return {
+    id: 'user-1',
+    email: 'admin@example.com',
+    displayName: '管理员',
+    role: 'admin',
+    isActive: true,
+    createdAt: 1_730_000_000_000,
+    updatedAt: 1_730_000_000_000,
+    lastLoginAt: 1_730_599_000_000,
+    ...overrides,
+  }
+}
+
+function makeMe(user: UserView, overrides: Partial<MeView> = {}): MeView {
+  return {
+    user,
+    twoFactor: {
+      totpEnabled: false,
+      emailOtpEnabled: false,
+      passkeyEnabled: false,
+      preferredMethod: null,
+    },
+    availableMethods: [],
+    ...overrides,
+  }
+}
+
+function makeSettings(overrides: Partial<SystemSettingsView> = {}): SystemSettingsView {
+  return {
+    registrationEnabled: false,
+    email: {
+      provider: 'none',
+      smtp: {
+        host: '',
+        port: 587,
+        username: '',
+        from: '',
+        fromName: '',
+        secure: false,
+        passwordConfigured: false,
+      },
+      resend: { from: '', fromName: '', apiKeyConfigured: false },
+    },
+    ...overrides,
+  }
+}
+
+/** 系统管理页的只读快照部分（viewer 也看得到）。 */
+describe('系统管理页 · 只读快照', () => {
   it('加载 /api/system/status 并展示 watchdog、存储、队列与密钥状态位', async () => {
     const status = makeStatus()
     const fetchMock = installFetchMock((url) => {
       if (url === '/api/system/status') return { body: { status } }
+      if (url === '/api/me') return { body: makeMe(makeUser({ role: 'viewer' })) }
       throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
@@ -52,9 +103,10 @@ describe('系统管理页', () => {
     const { container } = renderWithProviders(<SystemPage />)
     await screen.findByText('watchdog（全仓唯一 Cron）')
 
-    // 只打这一个接口，GET，无查询参数（页面不自造过滤条件）。
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(requestUrl(fetchMock.mock.calls[0])).toBe('/api/system/status')
+    // 状态快照只打一个接口，GET，无查询参数（页面不自造过滤条件）。
+    const statusCalls = fetchMock.mock.calls.filter((call) => requestUrl(call) === '/api/system/status')
+    expect(statusCalls).toHaveLength(1)
+    expect((statusCalls[0]?.[1] as RequestInit | undefined)?.method).toBeUndefined()
 
     // watchdog：上次运行时刻 + 上次到期任务数 + 下次唤醒
     expect(container.textContent).toContain(formatDateTime(status.watchdogLastRunAt))
@@ -78,7 +130,26 @@ describe('系统管理页', () => {
     expect(container.textContent).not.toContain(TEST_SESSION_TOKEN)
   })
 
-  it('密钥状态位只读：没有输入框 / 保存按钮，未配置时提示「部署前须配置」', async () => {
+  it('viewer 看不到管理面，只有「仅管理员」提示', async () => {
+    installFetchMock((url) => {
+      if (url === '/api/system/status') return { body: { status: makeStatus() } }
+      if (url === '/api/me') return { body: makeMe(makeUser({ role: 'viewer' })) }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+
+    renderWithProviders(<SystemPage />)
+    await screen.findByText('watchdog（全仓唯一 Cron）')
+
+    expect(await screen.findByText('管理面仅管理员可见')).toBeInTheDocument()
+    expect(screen.queryByText('用户管理')).not.toBeInTheDocument()
+    expect(screen.queryByText('注册开关')).not.toBeInTheDocument()
+    expect(screen.queryByText('邮件服务')).not.toBeInTheDocument()
+    // 状态快照仍是只读：没有可编辑控件
+    expect(screen.queryAllByRole('textbox')).toHaveLength(0)
+  })
+
+  it('密钥状态位只读：未配置时提示「部署前须配置」', async () => {
     const status = makeStatus({
       secrets: { setupSecretConfigured: true, jwtSecretConfigured: false },
       watchdogLastRunAt: null,
@@ -87,6 +158,7 @@ describe('系统管理页', () => {
     })
     installFetchMock((url) => {
       if (url === '/api/system/status') return { body: { status } }
+      if (url === '/api/me') return { body: makeMe(makeUser({ role: 'viewer' })) }
       throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
@@ -94,11 +166,6 @@ describe('系统管理页', () => {
     renderWithProviders(<SystemPage />)
     await screen.findByText('watchdog（全仓唯一 Cron）')
 
-    // 只读状态位：没有可编辑控件
-    expect(screen.queryAllByRole('textbox')).toHaveLength(0)
-    expect(screen.queryByRole('button', { name: /保存/ })).not.toBeInTheDocument()
-
-    // 一true一false 各自的状态位
     expect(screen.getAllByText('已配置')).toHaveLength(1)
     expect(screen.getAllByText('未配置')).toHaveLength(1)
 
@@ -121,6 +188,7 @@ describe('系统管理页', () => {
     })
     installFetchMock((url) => {
       if (url === '/api/system/status') return { body: { status } }
+      if (url === '/api/me') return { body: makeMe(makeUser({ role: 'viewer' })) }
       throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
@@ -142,6 +210,7 @@ describe('系统管理页', () => {
         }
         return { body: { status: makeStatus() } }
       }
+      if (url === '/api/me') return { body: makeMe(makeUser({ role: 'viewer' })) }
       throw new Error(`未预期的请求：${url}`)
     })
     authenticate()
@@ -156,5 +225,178 @@ describe('系统管理页', () => {
     await waitFor(() => {
       expect(screen.getByText('watchdog（全仓唯一 Cron）')).toBeInTheDocument()
     })
+  })
+})
+
+/** 系统管理页的管理面（仅 admin）：用户管理 / 注册开关 / 邮件服务。 */
+describe('系统管理页 · 管理面（admin）', () => {
+  it('用户列表：最后一个管理员不可降级 / 禁用 / 删除', async () => {
+    const me = makeUser()
+    const lastAdmin = makeUser({ id: 'user-1', role: 'admin', displayName: '唯一管理员' })
+    const viewer = makeUser({
+      id: 'user-2',
+      email: 'viewer@example.com',
+      displayName: '只读同学',
+      role: 'viewer',
+      lastLoginAt: null,
+    })
+
+    installFetchMock((url) => {
+      if (url === '/api/system/status') return { body: { status: makeStatus() } }
+      if (url === '/api/me') return { body: makeMe(me) }
+      if (url === '/api/users') return { body: { users: [lastAdmin, viewer] } }
+      if (url === '/api/system/settings') return { body: makeSettings() }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+
+    renderWithProviders(<SystemPage />)
+    await screen.findByText('只读同学')
+
+    // 唯一（启用中的）管理员：降级 / 禁用 / 删除全部禁用，并给出原因
+    const demote = screen.getAllByRole('button', { name: '降为只读' })[0]
+    expect(demote).toBeDisabled()
+    const disable = screen.getAllByRole('button', { name: '禁用' })[0]
+    expect(disable).toBeDisabled()
+    expect(screen.getAllByRole('button', { name: /删除/ })[0]).toBeDisabled()
+    expect(demote).toHaveAttribute('title', '最后一个管理员不能被降级（会锁死管理面）')
+
+    // viewer 行可以升级 / 禁用 / 删除
+    expect(screen.getByRole('button', { name: '升为管理员' })).toBeEnabled()
+    expect(screen.getAllByRole('button', { name: '删除' }).at(-1)).toBeEnabled()
+  })
+
+  it('升角色走 PATCH /api/users/:id，body 只有 role', async () => {
+    const target = makeUser({
+      id: 'user-2',
+      email: 'viewer@example.com',
+      displayName: '只读同学',
+      role: 'viewer',
+    })
+    const fetchMock = installFetchMock((url, init) => {
+      if (url === '/api/system/status') return { body: { status: makeStatus() } }
+      if (url === '/api/me') return { body: makeMe(makeUser()) }
+      if (url === '/api/users' && (init.method ?? 'GET') === 'GET') {
+        return { body: { users: [makeUser(), target] } }
+      }
+      if (url === '/api/users/user-2' && init.method === 'PATCH') {
+        return { body: { user: { ...target, role: 'admin' } } }
+      }
+      if (url === '/api/system/settings') return { body: makeSettings() }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<SystemPage />)
+    await user.click(await screen.findByRole('button', { name: '升为管理员' }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        (item) => requestUrl(item) === '/api/users/user-2' && (item[1] as RequestInit).method === 'PATCH',
+      )
+      expect(requestBody(call)).toEqual({ role: 'admin' })
+    })
+  })
+
+  it('注册开关：PUT /api/system/settings/registration {enabled}', async () => {
+    const fetchMock = installFetchMock((url, init) => {
+      if (url === '/api/system/status') return { body: { status: makeStatus() } }
+      if (url === '/api/me') return { body: makeMe(makeUser()) }
+      if (url === '/api/users') return { body: { users: [makeUser()] } }
+      if (url === '/api/system/settings' && (init.method ?? 'GET') === 'GET') {
+        return { body: makeSettings({ registrationEnabled: false }) }
+      }
+      if (url === '/api/system/settings/registration' && init.method === 'PUT') {
+        return { body: makeSettings({ registrationEnabled: true }) }
+      }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<SystemPage />)
+    const toggle = await screen.findByRole('switch', { name: '注册已关闭' })
+    await user.click(toggle)
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        (item) => requestUrl(item) === '/api/system/settings/registration',
+      )
+      expect(requestBody(call)).toEqual({ enabled: true })
+    })
+  })
+
+  it('邮件配置：脱敏展示、留空=不改、测试邮件', async () => {
+    const settings = makeSettings({
+      email: {
+        provider: 'smtp',
+        smtp: {
+          host: 'smtp.example.com',
+          port: 587,
+          username: 'notify',
+          from: 'noreply@example.com',
+          fromName: 'waker',
+          secure: false,
+          passwordConfigured: true,
+        },
+        resend: { from: '', fromName: '', apiKeyConfigured: false },
+      },
+    })
+    const fetchMock = installFetchMock((url, init) => {
+      if (url === '/api/system/status') return { body: { status: makeStatus() } }
+      if (url === '/api/me') return { body: makeMe(makeUser()) }
+      if (url === '/api/users') return { body: { users: [makeUser()] } }
+      if (url === '/api/system/settings' && (init.method ?? 'GET') === 'GET') return { body: settings }
+      if (url === '/api/system/settings/email' && init.method === 'PUT') return { body: settings }
+      if (url === '/api/system/settings/email/test' && init.method === 'POST') {
+        return { body: { sent: true } }
+      }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<SystemPage />)
+
+    // 脱敏：只报「已配置」，输入框留空且 placeholder 说明不修改
+    const passwordInput = await screen.findByLabelText('密码')
+    expect(passwordInput).toHaveValue('')
+    expect(passwordInput).toHaveAttribute('placeholder', '已配置，留空表示不修改')
+    expect(screen.getByText('已配置（不回显）')).toBeInTheDocument()
+
+    // 只改发件人名称 → 请求体里不带 password（留空 = 不改）
+    await user.clear(screen.getByLabelText('发件人名称'))
+    await user.type(screen.getByLabelText('发件人名称'), 'waker-bot')
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        (item) =>
+          requestUrl(item) === '/api/system/settings/email' &&
+          (item[1] as RequestInit).method === 'PUT',
+      )
+      expect(requestBody(call)).toEqual({
+        provider: 'smtp',
+        smtp: {
+          host: 'smtp.example.com',
+          port: 587,
+          username: 'notify',
+          from: 'noreply@example.com',
+          fromName: 'waker-bot',
+          secure: false,
+        },
+      })
+    })
+
+    // 测试邮件
+    await user.click(screen.getByRole('button', { name: /发送测试邮件/ }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        (item) => requestUrl(item) === '/api/system/settings/email/test',
+      )
+      expect(requestBody(call)).toEqual({})
+    })
+    expect(await screen.findByText(/测试邮件已发送到你的管理员邮箱/)).toBeInTheDocument()
   })
 })
