@@ -1,3 +1,5 @@
+import type { WakerDO } from './do/waker-do'
+
 /**
  * Worker 运行时绑定类型。
  *
@@ -26,8 +28,8 @@ export interface DeadLetterMessage {
 }
 
 export interface Env {
-  /** Durable Object 命名空间：任务真源（SQLite）。 */
-  WAKER_DO: DurableObjectNamespace
+  /** Durable Object 命名空间：任务真源（SQLite），单实例、原生 RPC。 */
+  WAKER_DO: DurableObjectNamespace<WakerDO>
   /** 主分发队列（生产端）。 */
   WAKER_QUEUE: Queue<JobMessage>
   /** 死信队列（生产端，用于手动重放 / 显式转死信）。 */
