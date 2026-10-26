@@ -1,35 +1,84 @@
-name: Deploy Dispatcher
+name: Deploy
 
+# 部署归用户关口：只允许手动触发，且必须显式确认。
+# 凭据未配齐时 preflight 会明确报出缺哪把 key，deploy job 直接跳过（不生成、不绕过）。
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      confirm:
+        description: '输入 deploy 确认执行生产部署'
+        required: true
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  preflight:
+    name: 凭据关口
     runs-on: ubuntu-latest
+    outputs:
+      creds_ready: ${{ steps.check.outputs.creds_ready }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: 逐键校验（SETUP_SECRET / JWT_SECRET / CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID）
+        id: check
+        env:
+          SETUP_SECRET: ${{ secrets.SETUP_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if bash scripts/ci/gen-secrets-file.sh --check; then
+            echo "creds_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "creds_ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::凭据关口未通过：请先在仓库 Settings → Secrets and variables 配齐上述 key，再重跑本工作流。"
+          fi
+
+      - name: 确认输入
+        if: inputs.confirm != 'deploy'
+        run: |
+          echo "::error::未确认部署：请在手动触发时把 confirm 填成 deploy。"
+          exit 1
+
+  deploy:
+    name: wrangler deploy
+    needs: preflight
+    if: needs.preflight.outputs.creds_ready == 'true' && inputs.confirm == 'deploy'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
         with:
-          run_install: false
+          node-version: '24'
+          cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Create KV namespace if not exists
-        run: pnpm wrangler kv namespace create CRON_REGISTRY || true
+      - name: 生成 $RUNNER_TEMP/secrets.json（0600，逐键非空，失败关闭）
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          SETUP_SECRET: ${{ secrets.SETUP_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: bash scripts/ci/gen-secrets-file.sh
 
-      - name: Deploy dispatcher Worker
-        run: pnpm wrangler deploy
+      - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler deploy --secrets-file "$RUNNER_TEMP/secrets.json"
+
+      - name: 清理明文 secrets 文件
+        if: always()
+        run: rm -f "$RUNNER_TEMP/secrets.json"

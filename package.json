@@ -1,35 +1,41 @@
 {
   "name": "workers-scheduler",
-  "version": "0.1.0",
-  "description": "Central cron dispatcher for Cloudflare Workers",
-  "exports": {
-    "./client": {
-      "import": "./dist/client/index.js",
-      "types": "./dist/client/index.d.ts"
-    }
-  },
-  "bin": {
-    "workers-scheduler": "./dist/cli/register.js"
-  },
+  "version": "2.0.0",
+  "private": true,
+  "description": "WorkerHub 全舰队统一调度平台：1 个 watchdog Cron + Durable Object Alarm + Queue",
+  "type": "module",
   "scripts": {
-    "build": "tsc",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "files": [
-    "dist"
-  ],
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260511.1",
-    "@types/node": "^25.7.0",
-    "typescript": "^6.0.3",
-    "vitest": "^1.6.0",
-    "wrangler": "^4.90.0"
+    "test:watch": "vitest",
+    "check:cron": "node scripts/check-single-cron.mjs",
+    "verify": "pnpm typecheck && pnpm lint && pnpm check:cron && pnpm test && pnpm build"
   },
   "dependencies": {
-    "croner": "^10.0.1"
+    "hono": "^4.13.14"
   },
-  "packageManager": "pnpm@10.33.0"
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261026.1",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.2",
+    "eslint": "^10.13.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.152.0"
+  },
+  "engines": {
+    "node": ">=22 <27"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
+  }
 }
