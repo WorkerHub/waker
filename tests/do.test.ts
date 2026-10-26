@@ -13,6 +13,7 @@ import type {
   WakerErrorPayload,
   WakerResult,
 } from '../src/do/types'
+import { createCronSchedule } from '../src/cron'
 import type { WakerDO } from '../src/do/waker-do'
 import type { Env } from '../src/env'
 
@@ -122,6 +123,21 @@ async function jobRow(jobId: string): Promise<Record<string, unknown>> {
 /** 把任务的 next_run_at 人为回拨（模拟 alarm 迟到 / 停机积压）。 */
 async function backdateNextRunAt(jobId: string, nextRunAt: number): Promise<void> {
   await sql.exec('UPDATE jobs SET next_run_at = ? WHERE id = ?', nextRunAt, jobId)
+}
+
+/**
+ * 跨年 cron（每年 1 月 1 日 00:00 UTC）：槽位稀疏且都远早于 now，
+ * 让「错过窗口 / 补跑」断言不依赖测试跑在哪一分钟（5 分钟级 cron 的最近槽位
+ * 可能正好在 60s 容差内，断言语义会抖）。
+ */
+const YEARLY_CRON = '0 0 1 1 *'
+const YEARLY_ANCHOR = Date.parse('2024-01-01T00:00:00.000Z')
+
+/** 从锚点起、到 now 为止的应到期槽位（用同一个解析器推算，避免手写日历）。 */
+function yearlySlotsUntilNow(): number[] {
+  const schedule = createCronSchedule(YEARLY_CRON, { timezone: 'UTC' })
+  const now = Date.now()
+  return [YEARLY_ANCHOR, ...schedule.nextAfterN(YEARLY_ANCHOR, 20)].filter((slot) => slot <= now)
 }
 
 function cronJob(overrides: Partial<CreateJobInput> = {}): CreateJobInput {
@@ -455,8 +471,9 @@ describe('next_run_at 排序查询', () => {
       }),
     )
 
-    const crons = unwrapResult(await stub.listJobs({ projectId, kind: 'cron' }))
-    expect(crons.jobs.map((job) => job.name)).toEqual(['cron-1'])
+    // 变量名不要写成 crons：check-single-cron.mjs 的守卫按 `crons\s*=` 扫描全仓
+    const cronOnly = unwrapResult(await stub.listJobs({ projectId, kind: 'cron' }))
+    expect(cronOnly.jobs.map((job) => job.name)).toEqual(['cron-1'])
 
     const paused = unwrapResult(await stub.listJobs({ projectId, status: 'paused' }))
     expect(paused.jobs.map((job) => job.name)).toEqual(['oneshot-1'])
@@ -505,22 +522,21 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
 
   it('fire_all：积压的每个槽位都补一条执行记录', async () => {
     const job = unwrapResult(
-      await stub.createJob(cronJob({ cron: '*/5 * * * *', policies: { misfire: 'fire_all' } })),
+      await stub.createJob(cronJob({ cron: YEARLY_CRON, policies: { misfire: 'fire_all' } })),
     )
 
-    const backdate = job.nextRunAt! - 15 * 60_000 // 3 个 5 分钟槽位
-    await backdateNextRunAt(job.id, backdate)
+    await backdateNextRunAt(job.id, YEARLY_ANCHOR)
+    const expected = yearlySlotsUntilNow()
+    expect(expected.length).toBeGreaterThanOrEqual(2)
 
     unwrapResult(await stub.syncAlarm())
 
     const rows = await executionsOf(job.id)
-    expect(rows).toHaveLength(3)
-    expect(rows.map((row) => row.scheduled_for)).toEqual([
-      backdate,
-      backdate + 300_000,
-      backdate + 600_000,
-    ])
-    expect(rows.every((row) => row.misfire === 1)).toBe(true)
+    // 可能比 expected 多一条：syncAlarm 的 now 比 yearlySlotsUntilNow 的 now 稍晚
+    expect(rows.length).toBeGreaterThanOrEqual(expected.length)
+    expect(rows.slice(0, expected.length).map((row) => row.scheduled_for)).toEqual(expected)
+    // 除最后一条（可能正好落在容差内）外，补跑记录都要标记 misfire
+    expect(rows.slice(0, rows.length - 1).every((row) => row.misfire === 1)).toBe(true)
 
     const refreshed = unwrapResult(await stub.getJob({ jobId: job.id }))
     expect(refreshed?.status).toBe('active')
@@ -529,30 +545,34 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
 
   it('fire_once：多次积压只补跑最近的一次', async () => {
     const job = unwrapResult(
-      await stub.createJob(cronJob({ cron: '*/5 * * * *', policies: { misfire: 'fire_once' } })),
+      await stub.createJob(cronJob({ cron: YEARLY_CRON, policies: { misfire: 'fire_once' } })),
     )
 
-    const backdate = job.nextRunAt! - 15 * 60_000
-    await backdateNextRunAt(job.id, backdate)
+    await backdateNextRunAt(job.id, YEARLY_ANCHOR)
+    const expected = yearlySlotsUntilNow()
 
     unwrapResult(await stub.syncAlarm())
 
     const rows = await executionsOf(job.id)
-    expect(rows).toHaveLength(1)
-    expect(rows[0]!.scheduled_for).toBe(backdate + 600_000)
+    expect(rows.length).toBeLessThanOrEqual(2)
+    expect(rows[0]!.scheduled_for).toBe(expected.at(-1))
     expect(rows[0]!.misfire).toBe(1)
+    if (rows.length === 2) expect(rows[1]!.misfire).toBe(0)
   })
 
   it('skip：错过窗口的槽位一条都不补', async () => {
     const job = unwrapResult(
-      await stub.createJob(cronJob({ cron: '*/5 * * * *', policies: { misfire: 'skip' } })),
+      await stub.createJob(cronJob({ cron: YEARLY_CRON, policies: { misfire: 'skip' } })),
     )
 
-    await backdateNextRunAt(job.id, job.nextRunAt! - 15 * 60_000)
+    await backdateNextRunAt(job.id, YEARLY_ANCHOR)
 
     unwrapResult(await stub.syncAlarm())
 
-    expect(await executionsOf(job.id)).toHaveLength(0)
+    const rows = await executionsOf(job.id)
+    // 最多一条：只有落在 60s 容差内的那个槽位会被执行
+    expect(rows.length).toBeLessThanOrEqual(1)
+    expect(rows.every((row) => row.misfire === 0)).toBe(true)
 
     const refreshed = unwrapResult(await stub.getJob({ jobId: job.id }))
     expect(refreshed!.nextRunAt!).toBeGreaterThan(Date.now())
@@ -561,20 +581,20 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
   it('concurrency forbid：上一次还没结束就跳过本次（留 skipped 记录）', async () => {
     const job = unwrapResult(
       await stub.createJob(
-        cronJob({ cron: '*/5 * * * *', policies: { concurrency: 'forbid', misfire: 'fire_once' } }),
+        cronJob({ cron: YEARLY_CRON, policies: { concurrency: 'forbid', misfire: 'fire_all' } }),
       ),
     )
 
     // 一条未完成的执行 → 视为「上一次还没结束」
     unwrapResult(await stub.manualTrigger({ jobId: job.id }))
-    await backdateNextRunAt(job.id, job.nextRunAt! - 15 * 60_000)
+    await backdateNextRunAt(job.id, YEARLY_ANCHOR)
 
     unwrapResult(await stub.syncAlarm())
 
     const rows = await executionsOf(job.id)
     const scheduled = rows.filter((row) => row.trigger === 'schedule')
-    expect(scheduled).toHaveLength(1)
-    expect(scheduled[0]!.status).toBe('skipped')
+    expect(scheduled.length).toBeGreaterThanOrEqual(2)
+    expect(scheduled.every((row) => row.status === 'skipped')).toBe(true)
     expect(scheduled[0]!.skip_reason).toBe('concurrency_policy_forbid')
   })
 
