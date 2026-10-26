@@ -11,20 +11,37 @@ import type { WakerDO } from './do/waker-do'
  *   `wrangler deploy --secrets-file` 注入；本地开发用 `.dev.vars`（已被 gitignore）。
  */
 
-/** 分发队列消息：alarm 到期后交给 consumer 执行。字段由后续单细化。 */
+/**
+ * 主队列消息（`waker-jobs`）：alarm 取出到期任务后，由 DO 投递，consumer 消费后同步回调下游。
+ *
+ * 消息体故意只带「指针」（executionId + attempt）：任务 payload、地址、signing key
+ * 一律不在队列里传 —— 队列消息可能被平台重试/转存/排查，不能携带凭据。
+ */
 export interface JobMessage {
   /** 执行唯一 id（下发下游做幂等，随回调带出） */
   executionId: string
   /** 任务 id */
   jobId: string
+  /** 项目 id（仅便于排查，判定以 DO 里的记录为准） */
+  projectId?: string
+  /** 第几次投递，0 = 首次；与执行记录的 attempt 不一致即为过期重试消息 */
+  attempt: number
 }
 
-/** 死信消息：主队列重试用尽后转入，由 consumer 存 DO 死信表。 */
+/**
+ * 死信队列消息（`waker-dlq`）：主队列重试用尽 / 永久失败后转入，由 consumer 存 DO 死信表。
+ *
+ * 注意：CF 在 `max_retries` 耗完时会把**主队列原始消息**（{@link JobMessage}）直接投到 DLQ，
+ * 那种消息没有 error/attempts，consumer 从执行记录里补全。
+ */
 export interface DeadLetterMessage {
   executionId: string
-  jobId: string
-  /** 最后一次失败原因（截断后存） */
-  error: string
+  jobId?: string
+  projectId?: string
+  /** 累计尝试次数（缺失时从执行记录取） */
+  attempts?: number
+  /** 最后一次失败原因（缺失时从执行记录取） */
+  error?: string | null
 }
 
 export interface Env {

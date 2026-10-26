@@ -40,7 +40,9 @@ queue = "waker-jobs"
 [[queues.consumers]]
 queue = "waker-jobs"
 max_batch_size = 10
-max_batch_timeout = 5
+# B3：调度器对延迟敏感 —— 单条消息最多等 1s 就投递（默认 5s 会让回调平白迟 5 秒），
+# 同一秒内到达的消息仍会被合并成批（摊薄 Queue 操作数）。
+max_batch_timeout = 1
 max_retries = 5
 dead_letter_queue = "waker-dlq"
 
@@ -52,5 +54,5 @@ queue = "waker-dlq"
 [[queues.consumers]]
 queue = "waker-dlq"
 max_batch_size = 10
-max_batch_timeout = 5
+max_batch_timeout = 1
 max_retries = 3

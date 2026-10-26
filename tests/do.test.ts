@@ -161,8 +161,9 @@ describe('数据模型：DO 启动即建好 SQLite 表', () => {
     }
 
     // 版本账本在 waker_meta 里（DO 的 SQLite 不允许读写 PRAGMA user_version）
+    // v2 = B3 追加（projects.callback_url + executions.signing_key_id/renewal_at/renewal_error）。
     const version = await sql.exec(`SELECT value FROM waker_meta WHERE key = 'schema_version'`)
-    expect(Number(version[0]!.value)).toBe(1)
+    expect(Number(version[0]!.value)).toBe(2)
   })
 })
 
@@ -372,7 +373,8 @@ describe('任务 CRUD 与策略字段读写', () => {
     const rows = await executionsOf(job.id)
     expect(rows).toHaveLength(1)
     expect(rows[0]!.trigger).toBe('manual')
-    expect(rows[0]!.status).toBe('pending')
+    // B3 起：落库即投递，状态由 pending 推进到 dispatched（consumer 消费是异步的，此处只看投递结果）。
+    expect(rows[0]!.status).toBe('dispatched')
     expect(rows[0]!.misfire).toBe(0)
 
     const refreshed = unwrapResult(await stub.getJob({ jobId: job.id }))
@@ -579,7 +581,8 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]!.scheduled_for).toBe(missedAt)
     expect(rows[0]!.misfire).toBe(1) // 迟到超过容差 → 按 fire_once 补跑一次
-    expect(rows[0]!.status).toBe('pending')
+    // B3 起：落库即投递 → dispatched（不再停在 pending）。
+    expect(rows[0]!.status).toBe('dispatched')
 
     const row = await jobRow(job.id)
     expect(row.status).toBe('completed')
@@ -680,7 +683,8 @@ describe('alarm：回看补发、misfire 策略、并发策略', () => {
     const rows = await executionsOf(job.id)
     const scheduled = rows.filter((row) => row.trigger === 'schedule')
     expect(scheduled.length).toBeGreaterThanOrEqual(2)
-    expect(scheduled.every((row) => row.status === 'pending')).toBe(true)
+    // allow：全部照常排队，没有一条被跳过（B3 起排完即投递，之后由 consumer 推进状态）。
+    expect(scheduled.map((row) => row.status)).not.toContain('skipped')
   })
 
   it('抖动：dispatchAt 落在 [scheduledFor, scheduledFor + jitter] 内', async () => {

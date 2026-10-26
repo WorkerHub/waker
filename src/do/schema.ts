@@ -114,6 +114,27 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX signing_keys_project ON signing_keys (project_id, revoked_at);
     `,
   },
+  {
+    version: 2,
+    sql: `
+      -- ── B3 执行引擎（回调协议 v2）：追加列，不改既有对象、不删数据 ──
+      -- 项目回调目标：项目根地址（平台拼 /_waker/execute）；B4 建项目时写入。
+      -- 为空的项目无法执行回调（执行会被直接判死进死信，不会用必败原因刷队列）。
+      ALTER TABLE projects ADD COLUMN callback_url TEXT;
+
+      -- 执行载荷快照：manualTrigger 的 payload 覆盖 / 死信重放都要按「这一次」的载荷回调，
+      -- 不能回读 jobs.payload（那是任务默认载荷）。为空的旧记录回落到 jobs.payload。
+      ALTER TABLE executions ADD COLUMN payload TEXT;
+
+      -- 执行记录审计：本次签名用的 signing key id（轮换后仍可回溯到底哪把钥匙签的）。
+      ALTER TABLE executions ADD COLUMN signing_key_id TEXT;
+      -- 自续结果：生效时的 nextRunAt（毫秒）；未续期为 NULL。
+      ALTER TABLE executions ADD COLUMN renewal_at INTEGER;
+      -- 自续被拒原因（not_requested / invalid_next_run_at / next_run_at_not_future / ...）。
+      -- 自续被拒不影响本次执行的成功判定，所以单独成列，不污染 error。
+      ALTER TABLE executions ADD COLUMN renewal_error TEXT;
+    `,
+  },
 ]
 
 /** 当前代码期望的 schema 版本。 */
