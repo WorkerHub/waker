@@ -1,0 +1,23 @@
+# 参考接入示例 —— **模式一（默认）：原生 CF Cron Trigger**
+#
+# 这是下游项目「未接入 waker」时的形态：自己占一个 Cron Trigger 槽，
+# scheduled() 直接由 CF 触发。SDK 在这种模式下完全不加载（WAKER_MODE 缺省即 cron）。
+#
+# 部署：
+#   wrangler deploy -c examples/reference-worker/wrangler.cron.toml
+#
+# 另一模式见同目录 wrangler.waker.toml（去掉 [triggers]、切成 waker 回调）。
+
+name = "waker-reference-worker"
+main = "src/index.ts"
+compatibility_date = "2026-10-26"
+workers_dev = true
+
+# 声明式任务的调度入口：这条表达式必须与 src/jobs.ts 里的 DAILY_CLEANUP_CRON 逐字一致
+# （原生模式只能拿到 controller.cron，示例按表达式逐字匹配到任务名）。
+[triggers]
+crons = ["0 3 * * *"]
+
+[vars]
+# 不写也行（缺省就是 cron）；写出来是为了让「模式」在配置里一眼可见。
+WAKER_MODE = "cron"

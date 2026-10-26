@@ -1,0 +1,20 @@
+{
+  "name": "@workerhub/waker-client",
+  "version": "2.0.0",
+  "private": false,
+  "description": "waker 客户端 SDK：Hono 回调 receiver + HMAC 验签 + executionId 幂等 + 注册/one-shot 客户端（对齐回调协议 v2 / 注册 API / CF cron 方言三份冻结契约）",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "hono": "^4.13.14"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
