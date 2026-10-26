@@ -91,7 +91,7 @@ async function jobRow(jobId: string): Promise<Record<string, unknown>> {
   return row
 }
 
-describe('管理面鉴权（SETUP_SECRET → 会话 JWT）', () => {
+describe('管理面鉴权（用户体系会话 JWT）', () => {
   it('healthz 不需要鉴权', async () => {
     const response = await http(ctx, '/healthz')
     expect(response.status).toBe(200)
@@ -110,26 +110,26 @@ describe('管理面鉴权（SETUP_SECRET → 会话 JWT）', () => {
     expect(response.body.error.code).toBe('unauthorized')
   })
 
-  it('SETUP_SECRET 不正确 → 401，不签发会话', async () => {
-    const response = await http<ErrorBody>(ctx, '/api/auth/setup', {
-      method: 'POST',
-      body: { setupSecret: 'wrong-secret' },
-    })
-    expect(response.status).toBe(401)
-    expect(response.body.error.code).toBe('unauthorized')
-  })
-
-  it('SETUP_SECRET 正确 → 签发带过期时间的会话 JWT', async () => {
+  it('会话 JWT 是 HS256 三段式，且能访问管理面', async () => {
     const sessionToken = await managementToken(ctx)
     expect(sessionToken.split('.')).toHaveLength(3)
 
-    const response = await http<{ session: { token: string; expiresAt: number } }>(
-      ctx,
-      '/api/auth/setup',
-      { method: 'POST', body: { setupSecret: TEST_SETUP_SECRET } },
-    )
+    const response = await http(ctx, '/api/projects', { token: sessionToken })
     expect(response.status).toBe(200)
-    expect(response.body.session.expiresAt).toBeGreaterThan(Date.now())
+  })
+
+  // ONE-462：首个管理员存在后，SETUP_SECRET 通道对两个入口一律失效（SPEC §3.2 锁死语义）。
+  it('已有管理员 → /api/setup 与旧 /api/auth/setup 均 403 already_initialized', async () => {
+    await managementToken(ctx)
+
+    for (const path of ['/api/setup', '/api/auth/setup']) {
+      const response = await http<ErrorBody>(ctx, path, {
+        method: 'POST',
+        body: { setupSecret: TEST_SETUP_SECRET },
+      })
+      expect(response.status, path).toBe(403)
+      expect(response.body.error.code).toBe('already_initialized')
+    }
   })
 })
 
@@ -757,7 +757,7 @@ describe('watchdog 校正与系统状态', () => {
 
     const before = await http<StatusBody>(ctx, '/api/system/status', { token })
     expect(before.status).toBe(200)
-    expect(before.body.status.schemaVersion).toBe(3)
+    expect(before.body.status.schemaVersion).toBe(4)
     expect(before.body.status.secrets).toEqual({
       setupSecretConfigured: true,
       jwtSecretConfigured: true,

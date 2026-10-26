@@ -102,7 +102,10 @@ scripts/ci/gen-secrets-file.sh 密钥管线（逐键非空 → secrets.json 0600
 | `dead_letters` | 死信：主队列重试用尽后由 DLQ consumer 转存，供管理面重放（`replayDeadLetter`） |
 | `projects` | 接入项目：`token_hash`（只存 `sha256(令牌)`，唯一索引直查）、`token_created_at` / `token_rotated_at`、`callback_url`（项目根地址，执行期拼 `/_waker/execute`） |
 | `signing_keys` | 每项目独立回调签名密钥：`secret` 自迁移 v3 起存 AES-256-GCM 信封（明文不落库）、`fingerprint`（展示用）、`algorithm`；轮换置 `revoked_at` / `rotated_at` |
-| `waker_meta` | schema 版本账本（DO 的 SQLite 不允许读写 `PRAGMA user_version`，故用表记版本） |
+| `users` | 用户（迁移 v4）：`email` 小写规范化 + 唯一索引、`password_hash`（PBKDF2-SHA256 100k，`salt:hash`）、`role`（`admin` / `viewer`）、`is_active`、`last_login_at` |
+| `user_2fa` | 每用户 2FA 配置（v4）：`totp_secret`（**密文信封**）、`totp_enabled`、`passkey_credentials`（JSON `[{id,publicKey,counter,name,createdAt}]`）、`passkey_enabled`、`email_otp_enabled`、`preferred_method` |
+| `auth_challenges` | 一次性状态（v4，替代 eNotify 的 KV）：`kind` ∈ `email_otp` / `totp_used` / `totp_setup`，`code_hash` **只存哈希**（`totp_setup` 里存 secret 的密文信封），过期/已消费行由 watchdog tick 清理 |
+| `waker_meta` | schema 版本账本（DO 的 SQLite 不允许读写 `PRAGMA user_version`，故用表记版本）+ 系统配置（`registration_enabled` / `email_provider` / `smtp_config` / `resend_config`）+ 鉴权临时状态（`auth_tmp:*`，见下） |
 
 调度模型要点：
 
@@ -258,11 +261,16 @@ B6 只用到 `invalid_argument`（两个查询都是只读、无「找不到」�
 
 cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 不另写一套解析。
 
-## 管理面 API（B4 冻结，供 F1 / F3 对齐）
+## 管理面 API（B4 契约 + ONE-462 用户体系鉴权，供 F1 / F3 对齐）
 
-鉴权：`POST /api/auth/setup`（body `{ "setupSecret": "<SETUP_SECRET>" }`）换 12 小时会话 JWT，
-应答 `{ session: { token, expiresAt } }`；其余 `/api/*` 需 `Authorization: Bearer <JWT>`
+鉴权（ONE-462 起）：`POST /api/auth/login`（邮箱 + 密码）换 12 小时会话 JWT，应答
+`{ session: { token, expiresAt }, user }`；启用了第二因素的用户先拿到 `tempToken`（≤5 分钟），
+过 `/api/auth/2fa/*` 才拿到正式会话。其余 `/api/*` 需 `Authorization: Bearer <JWT>`
 （Hono 原生 `hono/jwt` 签发与校验）。未鉴权一律 401 `unauthorized`。
+
+**`SETUP_SECRET` 换会话（`sub: 'owner'`）的后门已删除**：`SETUP_SECRET` 只在初始化阶段换一次性
+bootstrap 令牌，首个管理员建成后 `/api/setup` 与 `/api/auth/setup` 一律 403 `already_initialized`。
+权限矩阵在接口层强制：`viewer` 只读 GET + 本人设置，其余写接口一律 403 `forbidden`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -302,6 +310,51 @@ WakerDO（`src/do/input.ts`），HTTP 层只做参数搬运 + 错误码映射，
 
 仍未挂载的管理面子路径（如 `/api/metrics`）继续回 501 `not_implemented`：那是「还没做」的信号，
 与「路径不存在」（404）分开。
+
+## 用户体系与两步登录（ONE-462 实现，SPEC §3–§6）
+
+初始化（`SETUP_SECRET` 只干两件事：验密钥 + 建首个管理员）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/setup/state` | 公开：`{ schemaVersion, initialized, adminExists, registrationEnabled, emailProvider }` |
+| POST | `/api/setup` | `{ setupSecret }`（常量时间校验 + 按 IP 3 次/10 分钟限流）→ `{ schemaVersion, adminExists:false, bootstrapToken, expiresAt }`（令牌 ≤10 分钟、一次性） |
+| POST | `/api/setup/admin` | `{ bootstrapToken, email, password, displayName }` → 201 `{ user, session }`（首个用户即 `role='admin'`，判定与写入同一次 DO 调用内） |
+
+注册 / 登录 / 2FA：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/auth/register` | `{ email, password, displayName }` → 201 `{ user, session }`（开关关闭时 403 `registration_closed`；无用户时 403 `setup_required`） |
+| POST | `/api/auth/login` | 密码步：无已启用第二因素 → `{ requiresTwoFactor:false, user, session }`；有 → `{ requiresTwoFactor:true, user, methods, tempToken, expiresAt }` |
+| POST | `/api/auth/2fa/verify` | `{ tempToken, method:'totp'\|'email_otp', code }` → `{ user, session }` |
+| POST | `/api/auth/2fa/otp/send` | `{ tempToken }` → `{ sent:true, expiresAt }`（3 次/5 分钟/会话；provider 未配置或发送失败一律失败关闭） |
+| POST | `/api/auth/2fa/passkey/options` | `{ tempToken }` → WebAuthn `PublicKeyCredentialRequestOptions` |
+| POST | `/api/auth/2fa/passkey/verify` | `{ tempToken, response }` → `{ user, session }` |
+
+本人设置（`viewer` 也可用）：`GET/PATCH /api/me`、`POST /api/me/password`、
+`POST /api/me/2fa/totp/{setup,enable,disable}`、`POST /api/me/2fa/email-otp/{send,enable,disable}`、
+`GET /api/me/2fa/passkeys`、`POST /api/me/2fa/passkey/{options,verify}`、
+`PATCH|DELETE /api/me/2fa/passkeys/:credentialId`、`PUT /api/me/2fa/preferred`。
+解绑任一方法与改密码都要求复验当前密码（400 `password_required` / 403 `invalid_password`）。
+
+系统管理（仅 admin）：`GET /api/users`、`PATCH|DELETE /api/users/:userId`、
+`GET /api/system/settings`、`PUT /api/system/settings/registration`、
+`PUT /api/system/settings/email`、`POST /api/system/settings/email/test`。
+
+实现口径（评审重点）：
+
+- **TOTP secret / SMTP 密码 / Resend API Key 一律密文信封落库**（`waker-enc:v1:`），KEK 由
+  `JWT_SECRET` 经 HKDF-SHA256 派生，**每个用途独立 salt/info**（signing key / TOTP / 邮件 / 一次性码 pepper）；
+  TOTP 用 `otpauth` 库、WebAuthn 用 `@simplewebauthn/server`（均为 eNotify 已在用的依赖），不手搓算法。
+- **一次性验证码只存 HMAC 哈希**（pepper 同上独立派生），邮件 OTP 5 分钟、TOTP 防重放 90 秒；
+  与 eNotify「KV 存明文码」有意分叉（SPEC §0）。
+- **未配置邮件 provider 时不允许启用邮件 OTP**（409 `email_not_configured`），也不会静默置位；
+  发送失败即撤销挑战并回 `email_send_failed`（失败关闭）。
+- **不新增表 / 不新增 Cron**：bootstrap 令牌、临时 2FA 会话、Passkey 挑战、限流计数都放在
+  `waker_meta` 的 `auth_tmp:*` 键（SPEC §3.1 允许「等价的一次性状态」），由 watchdog tick 统一清理。
+- 邮件发送在 Worker 侧做（SMTP 用 `cloudflare:sockets`，实现移植自 eNotify `smtp-transport`），
+  DO 只负责解密凭据 —— 会话性网络 IO 不阻塞唯一 DO 的调度。
 
 ## 客户端 SDK（B5，`client/`）
 

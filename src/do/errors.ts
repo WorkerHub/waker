@@ -18,6 +18,21 @@ import type { WakerResult } from './types'
  *     或写入来源不合法导致，同样直接进死信不重试）
  *   - `internal`：平台内部错误（HTTP 500），调用方可重试
  *
+ * ONE-462（用户体系补遗）新增的鉴权类错误码：
+ *   - `already_initialized`：已有管理员，SETUP_SECRET 通道彻底失效（403）
+ *   - `setup_required`：还没有任何用户，必须先走 `/api/setup` 初始化（403）
+ *   - `registration_closed`：注册开关关闭（403）
+ *   - `invalid_credentials`：邮箱或密码错误（401，不区分两者，避免枚举）
+ *   - `invalid_token`：bootstrap / 临时 2FA 令牌无效或已过期（401）
+ *   - `two_factor_required` / `two_factor_invalid`：两步登录中间态 / 验码失败（401）
+ *   - `two_factor_not_enabled`：操作方法但该用户未启用该方法（409）
+ *   - `forbidden`：角色不足（viewer 碰写接口）或防自锁拒绝（403）
+ *   - `rate_limited`：限流命中（429）
+ *   - `user_not_found` / `passkey_not_found`（404）
+ *   - `duplicate_email`：邮箱已注册（409）
+ *   - `password_required` / `invalid_password`：敏感变更的密码复验（400 / 403）
+ *   - `email_not_configured` / `email_send_failed`：邮件未配置 / 发送失败（409 / 502）
+ *
  * B4（注册 API / 管理面）把 code 原样映射成 HTTP 错误体
  * `{ "error": { "code": string, "message": string, "details"?: object } }`，不得改写。
  */
@@ -39,6 +54,23 @@ export type WakerErrorCode =
   | 'signing_key_missing'
   | 'signing_key_unreadable'
   | 'callback_target_missing'
+  | 'already_initialized'
+  | 'setup_required'
+  | 'registration_closed'
+  | 'invalid_credentials'
+  | 'invalid_token'
+  | 'two_factor_required'
+  | 'two_factor_invalid'
+  | 'two_factor_not_enabled'
+  | 'forbidden'
+  | 'rate_limited'
+  | 'user_not_found'
+  | 'passkey_not_found'
+  | 'duplicate_email'
+  | 'password_required'
+  | 'invalid_password'
+  | 'email_not_configured'
+  | 'email_send_failed'
   | 'internal'
 
 /** `invalid_cron` 的 details：透出方言层错误码与字段，前端可精确定位。 */
