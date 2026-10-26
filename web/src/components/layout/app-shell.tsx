@@ -1,16 +1,25 @@
 import {
   CalendarClockIcon,
   FolderKanbanIcon,
+  InfoIcon,
   LogOutIcon,
   ScrollTextIcon,
+  ServerCogIcon,
+  SettingsIcon,
   TriangleAlertIcon,
   ZapIcon,
 } from 'lucide-react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 
 import { ThemeToggle } from '@/components/theme-toggle'
 import { VersionFooter } from '@/components/version-footer'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { useSession } from '@/stores/session'
 
@@ -18,7 +27,8 @@ import { useSession } from '@/stores/session'
  * 应用外壳：品牌 + 导航 + 主题切换 + 退出 + 页脚版本号。
  *
  * 导航顺序即作业流：任务 → 执行记录 → 死信 → 项目。
- * F3（设置 / 系统管理）后续子单追加到同一份 `NAV_ITEMS`，不需要改外壳结构。
+ * F3 的设置 / 关于 / 系统管理属于低频入口，收在右侧的「系统」菜单里
+ * （Radix DropdownMenu = shadcn 原生组件，不另造导航控件），主流程导航不被挤长。
  */
 const NAV_ITEMS = [
   { to: '/jobs', label: '任务管理', icon: CalendarClockIcon },
@@ -27,8 +37,16 @@ const NAV_ITEMS = [
   { to: '/projects', label: '项目管理', icon: FolderKanbanIcon },
 ] as const
 
+const SYSTEM_ITEMS = [
+  { to: '/system', label: '系统管理', icon: ServerCogIcon },
+  { to: '/settings', label: '设置', icon: SettingsIcon },
+  { to: '/about', label: '关于', icon: InfoIcon },
+] as const
+
 export function AppShell() {
   const logout = useSession((state) => state.logout)
+  const { pathname } = useLocation()
+  const inSystemSection = SYSTEM_ITEMS.some((item) => pathname.startsWith(item.to))
 
   return (
     <div className="flex min-h-svh flex-col bg-background">
@@ -65,6 +83,32 @@ export function AppShell() {
           </nav>
 
           <div className="ml-auto flex items-center gap-1">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn(inSystemSection && 'bg-secondary text-secondary-foreground')}
+                >
+                  <ServerCogIcon />
+                  系统
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-40">
+                {SYSTEM_ITEMS.map((item) => (
+                  <DropdownMenuItem
+                    key={item.to}
+                    asChild
+                    className={cn(pathname === item.to && 'bg-secondary text-secondary-foreground')}
+                  >
+                    <NavLink to={item.to}>
+                      <item.icon className="size-4" />
+                      {item.label}
+                    </NavLink>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <ThemeToggle />
             <Button variant="ghost" size="sm" onClick={logout}>
               <LogOutIcon />
