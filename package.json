@@ -18,8 +18,10 @@
     "verify": "pnpm typecheck && pnpm lint && pnpm check:cron && pnpm test && pnpm build"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^14.0.3",
     "croner": "^10.0.1",
-    "hono": "^4.13.14"
+    "hono": "^4.13.14",
+    "otpauth": "^9.5.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261026.1",

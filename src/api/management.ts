@@ -18,36 +18,26 @@ import type {
   UpdateProjectInput,
 } from '../do/types'
 import type { ApiEnv } from './auth'
-import { issueManagementSession, managementAuth } from './auth'
+import { sessionAuth, viewerWriteGuard } from './auth'
 import { jsonError, queryInt, queryValue, readJson, respond } from './errors'
 
 /**
  * 管理面 API（B4 冻结契约，供 F1「任务管理 / 项目管理」页与 F3「系统管理」页对接；
  * B7 追加执行记录 / 死信三条路由，供 F2 页面对接）。
  *
- * 鉴权：`POST /api/auth/setup` 用 `SETUP_SECRET` 换 12 小时会话 JWT，
- * 其余 `/api/*` 一律要求 `Authorization: Bearer <JWT>`（Hono 原生 `hono/jwt`）。
+ * 鉴权（ONE-462 起）：用户体系会话 JWT —— `POST /api/auth/login` 换 12 小时会话
+ * （启用 2FA 的用户还要过第二因素），其余 `/api/*` 一律要求 `Authorization: Bearer <JWT>`。
+ * 权限矩阵在中间件里强制：`viewer` 只能 GET，写接口一律 403（`viewerWriteGuard`）。
  *
  * 本模块只做「HTTP ↔ RPC」的薄映射：参数校验、错误码映射、响应体形状。
  * 业务语义（状态机、调度、对账、凭据）全部在 WakerDO，前端只按本契约调用。
  */
 export const managementRoutes = new Hono<ApiEnv>()
 
-/** 换会话（唯一不需要会话令牌的入口）。 */
-managementRoutes.post('/auth/setup', async (c) => {
-  const parsed = await readJson(c)
-  if (!parsed.ok) return jsonError(c, 'invalid_json', '请求体必须是 JSON')
-
-  const body = (parsed.value ?? {}) as Record<string, unknown>
-  const setupSecret = typeof body.setupSecret === 'string' ? body.setupSecret : ''
-  const session = await issueManagementSession(c.env, setupSecret)
-  if (session === null) return jsonError(c, 'unauthorized', 'SETUP_SECRET 不正确或未配置')
-
-  return c.json({ session: { token: session.token, expiresAt: session.expiresAt } })
-})
-
-// 注册顺序：上面这条路由之后的 `/api/*` 全部要过会话校验。
-managementRoutes.use('*', managementAuth())
+// 全部路由都要过会话校验 + 权限矩阵（`/api/setup` / `/api/auth/*` / `/api/me` / `/api/users`
+// 这些路由挂在别处，见 `app.ts`；它们各自声明自己的鉴权要求）。
+managementRoutes.use('*', sessionAuth())
+managementRoutes.use('*', viewerWriteGuard())
 
 // ───────────────────────── 项目管理 ─────────────────────────
 
