@@ -244,6 +244,57 @@ export interface ListDeadLettersResult {
   nextCursor: string | null
 }
 
+// ───────────────────── 系统状态（F3 系统管理页，B4 冻结契约） ─────────────────────
+//
+// HTTP `GET /api/system/status` → `{ status }`，形状与 `src/do/types.ts` 的
+// `SystemStatusView` 一致，+ HTTP 层补的两块（只有状态位与队列名，没有任何凭据值）：
+//   - `secrets`：SETUP_SECRET / JWT_SECRET **是否已配置**的布尔位；
+//   - `queue`：主队列 / 死信队列名。
+// 前端只读这份快照，不自己推断 watchdog 是否健康。
+
+export interface SystemCounts {
+  projects: number
+  jobs: number
+  activeJobs: number
+  executions: number
+  /** 等待投递的执行条数（> 0 说明 Queue 投递落后）。 */
+  pendingDispatches: number
+  deadLetters: number
+}
+
+/** 密钥配置状态位：只有布尔，契约里连掩码都没有，页面照此只展示状态。 */
+export interface SystemSecretsStatus {
+  setupSecretConfigured: boolean
+  jwtSecretConfigured: boolean
+}
+
+export interface SystemQueueStatus {
+  main: string
+  deadLetter: string
+}
+
+export interface SystemStatus {
+  /** 采集时刻（epoch ms）。 */
+  now: number
+  /** WakerDO 库内 schema 版本（= 迁移账本值）。 */
+  schemaVersion: number
+  /** watchdog（全仓唯一 Cron Trigger）上次 ping 到 DO 的时刻；从未跑过为 null。 */
+  watchdogLastRunAt: number | null
+  /** 上次 ping 处理到的到期任务数（watchdog 幂等，重复 ping 只补漏）。 */
+  watchdogLastDueJobs: number | null
+  /** 当前 alarm 唤醒时刻（null = 没有待跑任务）。 */
+  nextWakeAt: number | null
+  counts: SystemCounts
+  secrets: SystemSecretsStatus
+  queue: SystemQueueStatus
+}
+
+/** 平台状态快照（= B4 冻结的 `GET /api/system/status`）。 */
+export async function getSystemStatus(): Promise<SystemStatus> {
+  const body = await request<{ status: SystemStatus }>('/api/system/status')
+  return body.status
+}
+
 /** 重放结果：以同一任务新建一条 `manual` 执行，页面用它跟踪「哪一次执行」。 */
 export interface ReplayDeadLetterResult {
   deadLetterId: string

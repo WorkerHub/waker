@@ -10,6 +10,9 @@ import { ExecutionsPage } from '@/pages/executions-page'
 import { JobsPage } from '@/pages/jobs-page'
 import { LoginPage } from '@/pages/login-page'
 import { ProjectsPage } from '@/pages/projects-page'
+import { AboutPage } from '@/pages/about-page'
+import { SettingsPage } from '@/pages/settings-page'
+import { SystemPage } from '@/pages/system-page'
 import { useSession } from '@/stores/session'
 
 /**
@@ -17,7 +20,7 @@ import { useSession } from '@/stores/session'
  *
  * F1：任务管理（`/jobs`）、项目管理（`/projects`）。
  * F2：执行记录（`/executions`）、死信队列（`/dead-letters`）。
- * F3（设置 / 关于 / 系统管理）在各自子单里追加 `Route`，外壳与鉴权不用改。
+ * F3：设置（`/settings`）、关于（`/about`）、系统管理（`/system`）。
  */
 
 /** 未持有会话时一律回登录页；会话过期由 client 的 401 处理清掉。 */
@@ -53,6 +56,9 @@ export function App() {
             <Route path="/executions" element={<ExecutionsPage />} />
             <Route path="/dead-letters" element={<DeadLettersPage />} />
             <Route path="/projects" element={<ProjectsPage />} />
+            <Route path="/system" element={<SystemPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/about" element={<AboutPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/jobs" replace />} />
         </Routes>
