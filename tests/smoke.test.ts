@@ -3,6 +3,17 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 
 import { app } from '../src/app'
+import type { Env } from '../src/env'
+
+/**
+ * 仅用于「不碰 DO」的鉴权失败路径：没有 Authorization 头时中间件直接 401，
+ * 不会走到 DO 存根，所以这里给一个最小 env 就够了。
+ * 需要真 DO / 真 SQLite 的行为一律在 tests/api.test.ts 里用真 workerd 跑。
+ */
+const MINIMAL_ENV = {
+  SETUP_SECRET: 'unit-test-placeholder',
+  JWT_SECRET: 'unit-test-placeholder',
+} as unknown as Env
 
 describe('worker 骨架', () => {
   it('/healthz 返回 ok', async () => {
@@ -11,11 +22,11 @@ describe('worker 骨架', () => {
     expect(await response.json()).toEqual({ ok: true, service: 'waker' })
   })
 
-  it('未实现的管理面 / 注册 API 返回 501 占位', async () => {
-    for (const path of ['/api/jobs', '/v1/jobs']) {
-      const response = await app.request(path)
-      expect(response.status).toBe(501)
-      expect(await response.json()).toMatchObject({ error: 'not_implemented' })
+  it('B4 已挂载的管理面 / 注册 API 一律要求鉴权（无令牌 → 401，不再是 501 占位）', async () => {
+    for (const path of ['/api/jobs', '/api/projects', '/v1/jobs', '/v1/manifest', '/v1/whoami']) {
+      const response = await app.request(path, {}, MINIMAL_ENV)
+      expect(response.status, path).toBe(401)
+      expect(await response.json()).toMatchObject({ error: { code: 'unauthorized' } })
     }
   })
 

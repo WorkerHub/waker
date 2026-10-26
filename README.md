@@ -47,7 +47,11 @@ watchdog Cron（全仓唯一，每小时）──► ping WakerDO 校正 alarm
 
 ```
 src/index.ts            Worker 入口（fetch / scheduled / queue）
-src/app.ts              Hono 路由骨架（/healthz + 后续 API 占位 501）
+src/app.ts              Hono 路由表（/healthz + /v1 注册 API + /api 管理面 API）
+src/api/auth.ts         两套鉴权：项目令牌（bearerAuth）+ 管理面会话 JWT（hono/jwt）
+src/api/registration.ts 注册 API 路由（/v1/whoami /v1/jobs /v1/manifest）
+src/api/management.ts   管理面 API 路由（项目 / 凭据轮换 / 任务 / 系统状态）
+src/api/errors.ts       RPC 错误码 → HTTP 状态码与统一错误体
 src/do/waker-do.ts      WakerDO：任务生命周期 RPC + alarm tick + Queue 分发 + 执行结果回填/自续/死信
 src/do/schema.ts        SQLite 数据模型与迁移（版本账本在 waker_meta 表）
 src/do/types.ts         冻结 RPC 契约的出入参类型
@@ -55,6 +59,9 @@ src/do/errors.ts        WakerError + 返回信封（ok / failure）
 src/do/policies.ts      misfire 补跑决策、确定性抖动（纯逻辑）
 src/do/instance.ts      唯一实例取用入口（idFromName('waker')）
 src/do/engine-rpc.ts    执行引擎 RPC 面（consumer 专用：认领/回填/死信/重放）
+src/do/http-rpc.ts      HTTP 层用到的 RPC 面（编译期断言与 WakerDO 签名一致）
+src/do/keyring.ts       项目令牌哈希 / signing key 生成与 AES-GCM 信封（WebCrypto 原生）
+src/do/projects.ts      项目与凭据的数据访问层（只写哈希与密文）
 src/callback/protocol.ts  回调协议 v2 冻结常量与请求/响应结构
 src/callback/sign.ts      HMAC-SHA256 签名与参考验签（WebCrypto 原生）
 src/callback/client.ts    同步回调投递（超时 / 2xx 判定 / nextRunAt 提取）
@@ -76,8 +83,8 @@ scripts/ci/gen-secrets-file.sh 密钥管线（逐键非空 → secrets.json 0600
 | `jobs` | 任务：`kind` 分 `cron` / `one_shot`；策略字段 `misfire_policy` / `concurrency_policy` / `max_retries` / `backoff_seconds` / `timeout_seconds` / `jitter_seconds`；`next_run_at` 驱动 alarm |
 | `executions` | 执行记录：一次到期槽位一行，`scheduled_for`（名义时刻）/ `dispatch_at`（含抖动）/ `status` / `attempt` / 结果字段 |
 | `dead_letters` | 死信：主队列重试用尽后由 DLQ consumer 转存，供管理面重放（`replayDeadLetter`） |
-| `projects` | 接入项目（语义归 B4），令牌只存哈希；`callback_url` = 项目根地址（B3 用来拼回调地址） |
-| `signing_keys` | 每项目独立回调签名密钥，可轮换（语义归 B4） |
+| `projects` | 接入项目：`token_hash`（只存 `sha256(令牌)`，唯一索引直查）、`token_created_at` / `token_rotated_at`、`callback_url`（项目根地址，执行期拼 `/_waker/execute`） |
+| `signing_keys` | 每项目独立回调签名密钥：`secret` 自迁移 v3 起存 AES-256-GCM 信封（明文不落库）、`fingerprint`（展示用）、`algorithm`；轮换置 `revoked_at` / `rotated_at` |
 | `waker_meta` | schema 版本账本（DO 的 SQLite 不允许读写 `PRAGMA user_version`，故用表记版本） |
 
 调度模型要点：
@@ -157,10 +164,94 @@ B3 追加的执行引擎 RPC（consumer 专用，见 `src/do/engine-rpc.ts`）�
 | `recordDeadLetter` | `{ executionId, jobId?, projectId?, attempts?, error? }` | `DeadLetterView` |
 | `replayDeadLetter` | `{ deadLetterId }` | `{ deadLetterId, jobId, executionId, scheduledFor, dispatchAt }` |
 
+B4 追加（任务更新 / 清单对账 / 项目管理，仍是纯加法，B2/B3 的方法表与错误码零改动）：
+
+| 方法 | 入参 | 成功返回值 |
+|---|---|---|
+| `updateJob` | `{ jobId, cron?, runAt?, timezone?, payload?, policies?, enabled? }` | `JobView`（不换 id；排期字段变了才重算 `nextRunAt`） |
+| `syncManifest` | `{ projectId, jobs: ManifestJobInput[] }` | `{ projectId, created, updated, unchanged, paused, jobs }` |
+| `createProject` | `{ name, callbackUrl }` | `{ project, token, signingKey }`（明文唯一一次） |
+| `listProjects` / `getProject` | — / `{ projectId }` | `{ projects }` / `ProjectView \| null` |
+| `updateProject` | `{ projectId, name?, callbackUrl? }` | `ProjectView` |
+| `rotateProjectToken` | `{ projectId }` | `{ project, token }` |
+| `rotateSigningKey` | `{ projectId }` | `{ project, signingKey }` |
+| `verifyProjectToken` | `{ token }` | `{ projectId, projectName, callbackUrl } \| null` |
+| `getSystemStatus` | — | `{ now, schemaVersion, watchdogLastRunAt, watchdogLastDueJobs, nextWakeAt, counts }` |
+
 错误码：`invalid_argument` / `invalid_cron` / `invalid_timezone` / `invalid_run_at` / `invalid_policy` /
-`duplicate_job` / `job_not_found` / `job_cancelled` / `job_not_resumable` /
-`execution_not_found` / `dead_letter_not_found` / `signing_key_missing` / `callback_target_missing` / `internal`。
+`duplicate_job` / `duplicate_project` / `name_conflict` / `job_not_found` / `project_not_found` /
+`job_cancelled` / `job_not_resumable` / `execution_not_found` / `dead_letter_not_found` /
+`signing_key_missing` / `signing_key_unreadable` / `callback_target_missing` / `internal`。
 类型定义见 `src/do/types.ts`；调度器内部调用用 `unwrap()` 拆信封。
+
+## 注册 API（B4 冻结，供 B5 SDK / CI 对齐）
+
+鉴权：`Authorization: Bearer <项目令牌>`（建项目时发放，只存 `sha256` 哈希）。
+**项目身份只来自令牌**：请求体里若带 `projectId` 且与令牌项目不一致 → 400 `invalid_argument`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/whoami` | `{ project: { id, name } }`：令牌对应的项目身份 |
+| GET | `/v1/jobs` | 本项目任务列表；query `status` / `kind` / `limit` / `cursor`（游标语义同 `listJobs`） |
+| POST | `/v1/jobs` | 运行时创建任务（one-shot 为主）；body = `CreateJobInput` 去掉 `projectId`；201 `{ job }` |
+| DELETE | `/v1/jobs/{name}` | 取消任务（幂等）；200 `{ job }`；未知名字 404 `job_not_found` |
+| PUT | `/v1/manifest` | 部署期声明式同步 + 对账（幂等） |
+
+清单请求体：
+
+```jsonc
+{ "jobs": [ { "name": "nightly-cleanup", "cron": "0 3 * * *", "timezone": "Asia/Shanghai",
+              "payload": {}, "policies": {}, "enabled": true } ] }
+```
+
+应答 `{ projectId, created[], updated[], unchanged[], paused[], jobs[] }`：
+
+- 清单里有、平台没有 → 新建（`kind = 'cron'`，`created`）；
+- 内容或状态不一致 → 改写（`updated`；含从 `paused` 恢复、把已取消的 cron 按声明式复位）；
+- 平台侧多出、清单里没有的**同项目 cron 任务** → 停用（`paused`：`status = paused` + `next_run_at` 清空）；
+- 运行时 one-shot **不参与对账**：它是业务在运行时建的，CI 部署不该把用户正在跑的定时任务停掉；
+- 清单名被同项目 one_shot 占用 → 409 `name_conflict`；
+- 任一条目 cron 非法 → 400 `invalid_cron`（`details = { name, cron: { dialectCode, field } }`），**整批不写库**。
+
+cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 不另写一套解析。
+
+## 管理面 API（B4 冻结，供 F1 / F3 对齐）
+
+鉴权：`POST /api/auth/setup`（body `{ "setupSecret": "<SETUP_SECRET>" }`）换 12 小时会话 JWT，
+应答 `{ session: { token, expiresAt } }`；其余 `/api/*` 需 `Authorization: Bearer <JWT>`
+（Hono 原生 `hono/jwt` 签发与校验）。未鉴权一律 401 `unauthorized`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/auth/setup` | SETUP_SECRET → 会话 JWT |
+| GET | `/api/projects` | `{ projects: ProjectView[] }`（只有掩码，无明文） |
+| POST | `/api/projects` | `{ name, callbackUrl }` → 201 `{ project, token, signingKey }`（**明文唯一一次**） |
+| GET | `/api/projects/{id}` | `{ project }` |
+| PATCH | `/api/projects/{id}` | `{ name?, callbackUrl? }` → `{ project }` |
+| POST | `/api/projects/{id}/token/rotate` | `{ project, token }`（旧令牌立即失效） |
+| POST | `/api/projects/{id}/signing-key/rotate` | `{ project, signingKey }`（旧 key 标记撤销） |
+| GET | `/api/jobs?...` | `{ jobs, nextCursor }`（同 B2 `listJobs`） |
+| POST | `/api/jobs` | 201 `{ job }`（body 含 `projectId`，项目必须存在） |
+| GET | `/api/jobs/{id}` | `{ job }` |
+| PATCH | `/api/jobs/{id}` | `{ cron?, runAt?, timezone?, payload?, policies?, enabled? }` → `{ job }` |
+| POST | `/api/jobs/{id}/{pause\|resume\|cancel}` | `{ job }` |
+| POST | `/api/jobs/{id}/trigger` | 202 `{ jobId, executionId, scheduledFor, dispatchAt }` |
+| GET | `/api/system/status` | watchdog 上次校正 / schema 版本 / 计数 / 密钥状态位（只读，不含值） |
+
+凭据规则（两条硬要求）：
+
+- **项目令牌只存哈希**：`projects.token_hash = sha256(token)`，唯一索引直查；明文只在发放/轮换应答里
+  出现一次，列表与详情只回 `tokenFingerprint`（哈希前 16 hex）。
+- **signing key 加密存 DO**：`signing_keys.secret` 存 AES-256-GCM 信封；KEK 由 `JWT_SECRET` 经
+  HKDF-SHA256 派生（不新增部署期 secret）。解密只在 `WakerDO.#resolveCallbackTarget` 内发生：
+  明文不进队列消息、不进日志、不回 HTTP；解不开时报 `signing_key_unreadable` 并直接进死信
+  （绝不拿密文当明文签出一个「看起来正常」的错签名）。
+
+错误体固定为 `{ "error": { "code", "message", "details"? } }`，`code` 与 RPC 错误码一一对应
+（B4 新增 `project_not_found` / `duplicate_project` / `name_conflict` / `signing_key_unreadable`）。
+
+未挂载的管理面子路径（如 `/api/executions`、`/api/dead-letters`）仍回 501 `not_implemented`：
+它们依赖 B6 的 `listExecutions` / `listDeadLetters` 查询 RPC。
 
 ## 本地开发
 
@@ -176,6 +267,15 @@ DO 集成测试用 wrangler 的 `createTestHarness`（Miniflare → workerd）�
 wrangler.toml：真 DO 绑定、真 SQLite 后端、真 Queue 与真 queue consumer，断言直接查库，不是 mock。
 执行引擎的链路测试（`tests/engine.test.ts`）还会在 `127.0.0.1` 上真起一个下游 HTTP 服务，
 用项目 signing key 从**下游视角**独立验签——所以「签名可用」是被第三方视角证明过的。
+
+B4 的用例：
+
+- `tests/api.test.ts`：注册 API / 管理面 / 清单对账 / 凭据轮换，**全走 `worker.fetch` 的 HTTP 入口**
+  （真路由、真中间件、真鉴权），并同时断言库里的真实形态（令牌只存哈希、signing key 只存密文）；
+  最后一条是端到端：建项目拿明文 key → 改回调地址 → 建任务 → 手动触发 → 下游用那份明文验签通过。
+- `tests/keyring.test.ts`：令牌生成/哈希/掩码、AES-GCM 信封往返、换密钥与密文篡改必须解不开（fail closed）。
+- 测试用 `SETUP_SECRET` / `JWT_SECRET` 由 `createTestHarness` 的 `secrets` 选项注入（占位值），
+  与线上 `wrangler deploy --secrets-file` 注入的是同一组绑定名，代码路径一致。
 
 `.dev.vars` 只放本地占位值；真实密钥只存在于 GitHub Secrets 与平台侧。
 
@@ -205,6 +305,7 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 |---|---|
 | B1 | 脚手架、wrangler、CI/CD、密钥管线 |
 | B2 | WakerDO 数据模型 + 任务生命周期 RPC + CF 方言 cron 解析器 |
-| B3（本单） | 执行引擎：Queue 分发 + 回调协议 v2（HMAC）+ 重试/DLQ + 自续 |
-| B4 | 注册 API、项目管理与凭据、管理面 API |
+| B6 | 查询 RPC：`listExecutions` / `listDeadLetters`（执行记录页 / 死信页） |
+| B3 | 执行引擎：Queue 分发 + 回调协议 v2（HMAC）+ 重试/DLQ + 自续 |
+| B4（本单） | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
 | F1-F3 / B5 | 管理面前端、客户端 SDK |

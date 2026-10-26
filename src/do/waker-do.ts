@@ -15,42 +15,91 @@ import {
   normalizePayload,
   requireNonNegativeInt,
   requireString,
+  resolveCallbackBaseUrl,
   resolvePolicies,
   resolveTimezone,
   toEpochMs,
+  MAX_PROJECT_NAME_LENGTH,
 } from './input'
-import { MAX_CATCH_UP_OCCURRENCES, jitterOffsetMs, planOccurrences } from './policies'
-import { migrate } from './schema'
+import {
+  SIGNING_ALGORITHM,
+  decryptSigningSecret,
+  deriveSigningKeyKek,
+  encryptSigningSecret,
+  generateProjectToken,
+  generateSigningSecret,
+  hashProjectToken,
+  signingSecretFingerprint,
+} from './keyring'
+import {
+  currentSigningKeyRow,
+  findProjectRow,
+  findProjectRowByName,
+  findProjectRowByTokenHash,
+  insertProject,
+  insertSigningKey,
+  listProjectRows,
+  projectView,
+  requireProjectRow,
+  revokeSigningKeys,
+  updateProjectRow,
+  updateProjectTokenHash,
+} from './projects'
+import {
+  MAX_CATCH_UP_OCCURRENCES,
+  jitterOffsetMs,
+  planOccurrences,
+  policiesEqual,
+} from './policies'
+import { migrate, readMeta, readSchemaVersion, writeMeta } from './schema'
 import type {
   CallbackTargetView,
   ConcurrencyPolicy,
   CreateJobInput,
+  CreateProjectInput,
+  CreateProjectResult,
   DeadLetterInput,
   DeadLetterView,
   DispatchItem,
   ExecutionCallbackContext,
   ExecutionStatus,
   ExecutionTrigger,
+  IssuedSigningKey,
   JobKind,
+  JobPolicies,
   JobRef,
   JobStatus,
   JobView,
   JsonValue,
   ListJobsQuery,
   ListJobsResult,
+  ListProjectsResult,
+  ManifestJobInput,
   ManualTriggerInput,
   ManualTriggerResult,
   MisfirePolicy,
   PrepareExecutionInput,
   PrepareExecutionResult,
   PrepareSkipReason,
+  ProjectAuthView,
+  ProjectView,
   RecordExecutionInput,
   RecordExecutionResult,
   RenewalOutcome,
   RenewalRejectionReason,
   ReplayDeadLetterInput,
   ReplayDeadLetterResult,
+  RotateProjectTokenInput,
+  RotateProjectTokenResult,
+  RotateSigningKeyInput,
+  RotateSigningKeyResult,
   SyncAlarmResult,
+  SyncManifestInput,
+  SyncManifestResult,
+  SystemStatusView,
+  UpdateJobInput,
+  UpdateProjectInput,
+  VerifyProjectTokenInput,
   WakerResult,
 } from './types'
 
@@ -68,6 +117,13 @@ const EXECUTION_LEASE_GRACE_MS = 60_000
 
 /** 死信/执行记录里错误文本的存储上限。 */
 const MAX_ERROR_LENGTH = 1000
+
+/** 单次声明式清单最多接受多少个任务（防一次请求把 DO 事务撑爆）。 */
+const MAX_MANIFEST_JOBS = 200
+
+/** watchdog 账本键（系统管理页据此显示上次校正时刻）。 */
+const WATCHDOG_LAST_RUN_AT = 'watchdog_last_run_at'
+const WATCHDOG_LAST_DUE_JOBS = 'watchdog_last_due_jobs'
 
 /** jobs 表行（列名与 SQL 一一对应；索引签名是 SqlStorage 的行约束）。 */
 interface JobRow extends Record<string, string | number | null> {
@@ -151,6 +207,9 @@ interface TickOutcome {
  * 存储硬约束：真源只在这里（this.ctx.storage.sql），不引入 D1 / KV。
  */
 export class WakerDO extends DurableObject<Env> {
+  /** signing key 的 KEK（惰性派生，每实例一次；不落库、不进日志）。 */
+  #kek: Promise<CryptoKey> | null = null
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     // 幂等迁移：DO 每个实例唤醒时都跑一遍，版本已到位时是空操作。
@@ -218,15 +277,8 @@ export class WakerDO extends DurableObject<Env> {
 
     const status: JobStatus = enabled ? 'active' : 'paused'
     const nextRunAt = enabled ? (schedule ? schedule.nextAfter(now) : runAt) : null
-    const id = crypto.randomUUID()
 
-    sql.exec(
-      `INSERT INTO jobs (
-         id, project_id, name, kind, cron_expression, cron_normalized, timezone, run_at, payload,
-         misfire_policy, concurrency_policy, max_retries, backoff_seconds, timeout_seconds, jitter_seconds,
-         status, next_run_at, last_run_at, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-      id,
+    const jobId = this.#insertJobRow({
       projectId,
       name,
       kind,
@@ -234,21 +286,64 @@ export class WakerDO extends DurableObject<Env> {
       cronNormalized,
       timezone,
       runAt,
-      JSON.stringify(payload),
-      policies.misfire,
-      policies.concurrency,
-      policies.maxRetries,
-      policies.backoffSeconds,
-      policies.timeoutSeconds,
-      policies.jitterSeconds,
+      payload,
+      policies,
       status,
       nextRunAt,
       now,
-      now,
-    )
+    })
 
     await this.#rescheduleAlarm()
-    return this.#requireView({ jobId: id })
+    return this.#requireView({ jobId })
+  }
+
+  /**
+   * 插入一条任务行（`createJob` / 声明式清单对账 / 死信重放共用）。
+   *
+   * 只做写入与返回新 id；调用方负责唯一性校验、`next_run_at` 计算与 alarm 重算。
+   */
+  #insertJobRow(params: {
+    projectId: string
+    name: string
+    kind: JobKind
+    cronExpression: string | null
+    cronNormalized: string | null
+    timezone: string
+    runAt: number | null
+    payload: JsonValue
+    policies: JobPolicies
+    status: JobStatus
+    nextRunAt: number | null
+    now: number
+  }): string {
+    const id = crypto.randomUUID()
+    this.ctx.storage.sql.exec(
+      `INSERT INTO jobs (
+         id, project_id, name, kind, cron_expression, cron_normalized, timezone, run_at, payload,
+         misfire_policy, concurrency_policy, max_retries, backoff_seconds, timeout_seconds, jitter_seconds,
+         status, next_run_at, last_run_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      id,
+      params.projectId,
+      params.name,
+      params.kind,
+      params.cronExpression,
+      params.cronNormalized,
+      params.timezone,
+      params.runAt,
+      JSON.stringify(params.payload),
+      params.policies.misfire,
+      params.policies.concurrency,
+      params.policies.maxRetries,
+      params.policies.backoffSeconds,
+      params.policies.timeoutSeconds,
+      params.policies.jitterSeconds,
+      params.status,
+      params.nextRunAt,
+      params.now,
+      params.now,
+    )
+    return id
   }
 
   /** 取消任务（终态）：不再进调度，历史执行记录保留。 */
@@ -470,7 +565,12 @@ export class WakerDO extends DurableObject<Env> {
    */
   async syncAlarm(): Promise<WakerResult<SyncAlarmResult>> {
     try {
-      return ok(await this.#runTick(Date.now()))
+      const result = await this.#runTick(Date.now())
+      // watchdog 账本：管理面「系统管理」页用它显示上次校正时刻与处理量。
+      // 只记统计量与时刻，不含任务载荷与凭据。
+      writeMeta(this.ctx.storage.sql, WATCHDOG_LAST_RUN_AT, String(result.now))
+      writeMeta(this.ctx.storage.sql, WATCHDOG_LAST_DUE_JOBS, String(result.dueJobs))
+      return ok(result)
     } catch (error) {
       return toFailure(error)
     }
@@ -818,7 +918,7 @@ export class WakerDO extends DurableObject<Env> {
       }
     }
 
-    const target = this.#resolveCallbackTarget(job)
+    const target = await this.#resolveCallbackTarget(job)
 
     this.ctx.storage.sql.exec(
       `UPDATE executions SET status = 'running', started_at = ?, attempt = ?, signing_key_id = ? WHERE id = ?`,
@@ -1174,36 +1274,37 @@ export class WakerDO extends DurableObject<Env> {
     return { applied: true, nextRunAt, reason: null }
   }
 
-  /** 回调目标：项目根地址 + 当前生效的 signing key（B4 建项目时填这两样）。 */
-  #resolveCallbackTarget(job: JobRow): CallbackTargetView {
+  /**
+   * 回调目标：项目根地址 + 当前生效的 signing key 明文。
+   *
+   * signing key 在库里是 AES-GCM 信封（B4）：解密**只在这里发生**，明文只作为本次
+   * 调用的返回值交给 consumer 签名用，绝不返回给 HTTP 层、不进队列消息、不进日志。
+   */
+  async #resolveCallbackTarget(job: JobRow): Promise<CallbackTargetView> {
     const sql = this.ctx.storage.sql
-    const project = sql
-      .exec<{ id: string; name: string | null; callback_url: string | null }>(
-        'SELECT id, name, callback_url FROM projects WHERE id = ? LIMIT 1',
-        job.project_id,
-      )
-      .toArray()[0]
+    const project = findProjectRow(sql, job.project_id)
 
-    if (project === undefined || project.callback_url === null || project.callback_url.trim() === '') {
+    if (project === null || project.callback_url === null || project.callback_url.trim() === '') {
       throw new WakerError(
         'callback_target_missing',
         `项目 ${job.project_id} 未配置 callback_url，无法回调任务 ${job.name}`,
       )
     }
 
-    const key = sql
-      .exec<{ id: string; secret: string }>(
-        `SELECT id, secret FROM signing_keys
-         WHERE project_id = ? AND revoked_at IS NULL
-         ORDER BY created_at DESC LIMIT 1`,
-        job.project_id,
-      )
-      .toArray()[0]
-
-    if (key === undefined) {
+    const key = currentSigningKeyRow(sql, job.project_id)
+    if (key === null) {
       throw new WakerError(
         'signing_key_missing',
         `项目 ${job.project_id} 没有可用的 signing key，无法签名回调`,
+      )
+    }
+
+    const secret = await decryptSigningSecret(key.secret, await this.#requireKek())
+    if (secret === null) {
+      // 换过 JWT_SECRET 或有非法写入都会走到这里：宁可判死进死信，也不拿密文当明文签出一个错签名。
+      throw new WakerError(
+        'signing_key_unreadable',
+        `项目 ${job.project_id} 的 signing key 无法解密（key ${key.id}），请轮换 signing key`,
       )
     }
 
@@ -1212,8 +1313,20 @@ export class WakerDO extends DurableObject<Env> {
       projectName: project.name,
       callbackUrl: resolveCallbackUrl(project.callback_url),
       signingKeyId: key.id,
-      signingSecret: key.secret,
+      signingSecret: secret,
     }
+  }
+
+  /**
+   * signing key 的加密密钥（KEK）：由 `JWT_SECRET` 经 HKDF 派生，每个 DO 实例只算一次。
+   *
+   * 选 `JWT_SECRET` 而不是新加一个部署期 secret：SPEC 只给本项目两个 secret
+   * （SETUP_SECRET / JWT_SECRET），signing key 本身不进 env / CI；
+   * 加新 secret 会多一道部署关口，而 HKDF 已经能做到「一把源密钥、每个用途一个子密钥」。
+   */
+  #requireKek(): Promise<CryptoKey> {
+    this.#kek ??= deriveSigningKeyKek(this.env.JWT_SECRET)
+    return this.#kek
   }
 
   #markExecutionSkipped(executionId: string, reason: string, now: number): void {
@@ -1355,6 +1468,527 @@ export class WakerDO extends DurableObject<Env> {
       lastRunAt: row.last_run_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+    }
+  }
+
+  // ───────────────────── B4：任务更新 / 声明式清单对账 ─────────────────────
+
+  /**
+   * 更新任务字段（B4 新增，B2 冻结契约的**纯加法**）。
+   *
+   * 为什么不换 job id 重建：`(project_id, name)` 是唯一键，改名等于换任务；
+   * 而换 id 会切断执行历史与 one_shot「同一 job 系列」的自续语义。
+   *
+   * 语义：
+   *   - 未出现的字段保持原值；`enabled` 是显式开关（false = 暂停，true = 恢复并重算）；
+   *   - 排期相关字段（cron / runAt / timezone）变了、或从暂停转回活跃时才重算 `next_run_at`，
+   *     改 payload / 策略不会把任务的下一次执行时间平白推后；
+   *   - cancelled 是终态（`job_cancelled`），completed 的 one_shot 不可再改（`job_not_resumable`）。
+   */
+  async updateJob(input: UpdateJobInput): Promise<WakerResult<JobView>> {
+    try {
+      const view = this.ctx.storage.transactionSync(() => {
+        const jobId = requireString(input?.jobId, 'jobId')
+        const row = this.#requireJobRow({ jobId })
+        if (row.status === 'cancelled') {
+          throw new WakerError('job_cancelled', `任务已取消，无法修改：${row.id}`)
+        }
+        if (row.status === 'completed') {
+          throw new WakerError('job_not_resumable', `one-shot 任务已执行完毕，无法修改：${row.id}`)
+        }
+        return this.#applyJobPatch(row, input, Date.now())
+      })
+      await this.#rescheduleAlarm()
+      return ok(view)
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /** 把一次更新落到库里（`updateJob` 与声明式对账共用同一套字段语义）。 */
+  #applyJobPatch(row: JobRow, input: Omit<UpdateJobInput, 'jobId'>, now: number): JobView {
+    const kind = row.kind as JobKind
+    const timezone = input.timezone === undefined ? row.timezone : resolveTimezone(input.timezone)
+
+    let schedule: CronSchedule | null = null
+    if (kind === 'cron') {
+      const expression = input.cron === undefined ? row.cron_expression : requireString(input.cron, 'cron')
+      if (expression === null) {
+        throw new WakerError('internal', `任务 ${row.id} 是 cron 类型但缺少表达式`)
+      }
+      schedule = buildSchedule(expression, timezone)
+    } else if (input.cron !== undefined) {
+      throw new WakerError('invalid_argument', 'one_shot 任务不接受 cron（请改 runAt）')
+    }
+
+    let runAt = row.run_at
+    if (input.runAt !== undefined) {
+      if (kind !== 'one_shot') {
+        throw new WakerError('invalid_argument', 'cron 任务不接受 runAt（请改 cron）')
+      }
+      runAt = toEpochMs(input.runAt)
+    }
+
+    const payload =
+      input.payload === undefined ? (JSON.parse(row.payload) as JsonValue) : normalizePayload(input.payload)
+    const policies = input.policies === undefined ? this.#policiesOf(row) : resolvePolicies(input.policies)
+    const active = input.enabled === undefined ? row.status === 'active' : input.enabled
+    const status: JobStatus = active ? 'active' : 'paused'
+
+    const scheduleChanged =
+      timezone !== row.timezone ||
+      runAt !== row.run_at ||
+      (schedule !== null && schedule.expression !== row.cron_expression)
+    let nextRunAt: number | null
+    if (!active) {
+      nextRunAt = null
+    } else if (schedule !== null) {
+      nextRunAt = schedule.nextAfter(now)
+    } else {
+      nextRunAt = runAt
+    }
+    // 只改载荷/策略且任务仍在跑：保留原来的下次执行时刻，别把它推后。
+    if (active && row.status === 'active' && !scheduleChanged && row.next_run_at !== null) {
+      nextRunAt = row.next_run_at
+    }
+
+    this.ctx.storage.sql.exec(
+      `UPDATE jobs SET
+         cron_expression = ?, cron_normalized = ?, timezone = ?, run_at = ?, payload = ?,
+         misfire_policy = ?, concurrency_policy = ?, max_retries = ?, backoff_seconds = ?,
+         timeout_seconds = ?, jitter_seconds = ?, status = ?, next_run_at = ?, updated_at = ?
+       WHERE id = ?`,
+      schedule === null ? row.cron_expression : schedule.expression,
+      schedule === null ? row.cron_normalized : schedule.normalized,
+      timezone,
+      runAt,
+      JSON.stringify(payload),
+      policies.misfire,
+      policies.concurrency,
+      policies.maxRetries,
+      policies.backoffSeconds,
+      policies.timeoutSeconds,
+      policies.jitterSeconds,
+      status,
+      nextRunAt,
+      now,
+      row.id,
+    )
+
+    return this.#requireView({ jobId: row.id })
+  }
+
+  /**
+   * 声明式清单对账（部署期 CI 调用）：一次事务内完成「建 / 改 / 停」。
+   *
+   * 对账**范围**：该项目的声明式 cron 任务（`kind = 'cron'`）。
+   * 运行时 one-shot 不参与对账 —— 它们是业务在运行时创建的，CI 部署不该把用户
+   * 正在跑的定时信/提醒当成「多出来的任务」停掉。
+   *
+   * 三种结果：
+   *   - 清单里有、平台没有 → 新建（`created`）；
+   *   - 清单里有、平台已有但内容/状态不一致 → 改写（`updated`，含从暂停恢复、从取消复位）；
+   *   - 平台侧多出的同项目 cron 任务 → 停用（`paused`，status 置 paused + 清 `next_run_at`）。
+   *
+   * 全有或全无：先整体校验（表达式 / 时区 / 策略 / 清单内重名），任一条不合法都不写库，
+   * 避免 CI 对账把一半任务改掉后停在中间态。
+   */
+  async syncManifest(input: SyncManifestInput): Promise<WakerResult<SyncManifestResult>> {
+    try {
+      const result = this.ctx.storage.transactionSync(() => this.#syncManifest(input))
+      await this.#rescheduleAlarm()
+      return ok(result)
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  #syncManifest(input: SyncManifestInput): SyncManifestResult {
+    const now = Date.now()
+    const sql = this.ctx.storage.sql
+    const projectId = requireString(input?.projectId, 'projectId')
+    requireProjectRow(sql, projectId)
+
+    if (!Array.isArray(input.jobs)) {
+      throw new WakerError('invalid_argument', 'jobs 必须是数组')
+    }
+    if (input.jobs.length > MAX_MANIFEST_JOBS) {
+      throw new WakerError('invalid_argument', `单次清单最多 ${MAX_MANIFEST_JOBS} 个任务`)
+    }
+
+    const desired = input.jobs.map((entry, index) => this.#validateManifestEntry(entry, index))
+
+    const created: string[] = []
+    const updated: string[] = []
+    const unchanged: string[] = []
+
+    for (const entry of desired) {
+      const existing = this.#findJobRow({ projectId, name: entry.name })
+
+      if (existing === null) {
+        this.#insertJobRow({
+          projectId,
+          name: entry.name,
+          kind: 'cron',
+          cronExpression: entry.schedule.expression,
+          cronNormalized: entry.schedule.normalized,
+          timezone: entry.timezone,
+          runAt: null,
+          payload: entry.payload,
+          policies: entry.policies,
+          status: entry.enabled ? 'active' : 'paused',
+          nextRunAt: entry.enabled ? entry.schedule.nextAfter(now) : null,
+          now,
+        })
+        created.push(entry.name)
+        continue
+      }
+
+      if (existing.kind !== 'cron') {
+        throw new WakerError(
+          'name_conflict',
+          `任务名 ${entry.name} 已被一个运行时 one_shot 任务占用：它不参与声明式对账，请改名`,
+          { name: entry.name, kind: existing.kind },
+        )
+      }
+
+      const sameContent =
+        existing.cron_expression === entry.schedule.expression &&
+        existing.timezone === entry.timezone &&
+        existing.payload === JSON.stringify(entry.payload) &&
+        policiesEqual(this.#policiesOf(existing), entry.policies)
+      const desiredStatus: JobStatus = entry.enabled ? 'active' : 'paused'
+      if (sameContent && existing.status === desiredStatus) {
+        unchanged.push(entry.name)
+        continue
+      }
+
+      // 直接写库而不是走 pause/resume：对账在一个事务里完成，且已取消的 cron 任务
+      // 按清单声明式复位（`resumeJob` 的 job_cancelled 终态语义不受影响）。
+      this.ctx.storage.sql.exec(
+        `UPDATE jobs SET
+           cron_expression = ?, cron_normalized = ?, timezone = ?, payload = ?,
+           misfire_policy = ?, concurrency_policy = ?, max_retries = ?, backoff_seconds = ?,
+           timeout_seconds = ?, jitter_seconds = ?, status = ?, next_run_at = ?, updated_at = ?
+         WHERE id = ?`,
+        entry.schedule.expression,
+        entry.schedule.normalized,
+        entry.timezone,
+        JSON.stringify(entry.payload),
+        entry.policies.misfire,
+        entry.policies.concurrency,
+        entry.policies.maxRetries,
+        entry.policies.backoffSeconds,
+        entry.policies.timeoutSeconds,
+        entry.policies.jitterSeconds,
+        desiredStatus,
+        entry.enabled ? entry.schedule.nextAfter(now) : null,
+        now,
+        existing.id,
+      )
+      updated.push(entry.name)
+    }
+
+    // 停用平台侧多出来的同项目 cron 任务（已经在 paused 的不重复计数）。
+    const paused: string[] = []
+    const manifestNames = new Set(desired.map((entry) => entry.name))
+    for (const row of this.#projectCronRows(projectId)) {
+      if (manifestNames.has(row.name) || row.status !== 'active') continue
+      this.ctx.storage.sql.exec(
+        `UPDATE jobs SET status = 'paused', next_run_at = NULL, updated_at = ? WHERE id = ?`,
+        now,
+        row.id,
+      )
+      paused.push(row.name)
+    }
+
+    return {
+      projectId,
+      created,
+      updated,
+      unchanged,
+      paused,
+      jobs: this.#projectCronRows(projectId).map((row) => this.#toView(row)),
+    }
+  }
+
+  /** 清单条目校验 + 规范化（任何一条不合法都在写库之前抛错）。 */
+  #validateManifestEntry(
+    entry: ManifestJobInput,
+    index: number,
+  ): {
+    name: string
+    timezone: string
+    schedule: CronSchedule
+    payload: JsonValue
+    policies: JobPolicies
+    enabled: boolean
+  } {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new WakerError('invalid_argument', `jobs[${index}] 必须是对象`)
+    }
+
+    const name = requireString(entry.name, `jobs[${index}].name`)
+    if (name.length > MAX_NAME_LENGTH) {
+      throw new WakerError('invalid_argument', `jobs[${index}].name 最长 ${MAX_NAME_LENGTH} 字符`, {
+        name,
+      })
+    }
+
+    const timezone = resolveTimezone(entry.timezone)
+    const rawCron = requireString(entry.cron, `jobs[${index}].cron`)
+
+    let schedule: CronSchedule
+    try {
+      schedule = buildSchedule(rawCron, timezone)
+    } catch (error) {
+      // 方言错误原样透出 `details.cron`（B2 冻结），额外带上任务名，CI 能一眼定位是哪条。
+      if (error instanceof WakerError) {
+        throw new WakerError(error.code, `清单任务 ${name}：${error.message}`, {
+          name,
+          ...(error.details ?? {}),
+        })
+      }
+      throw error
+    }
+
+    return {
+      name,
+      timezone,
+      schedule,
+      payload: normalizePayload(entry.payload),
+      policies: resolvePolicies(entry.policies),
+      enabled: entry.enabled !== false,
+    }
+  }
+
+  /** 该项目全部 cron 任务行（对账后回读，供 CI / SDK 核对落库结果）。 */
+  #projectCronRows(projectId: string): JobRow[] {
+    return this.ctx.storage.sql
+      .exec<JobRow>(
+        `SELECT * FROM jobs WHERE project_id = ? AND kind = 'cron' ORDER BY name, id`,
+        projectId,
+      )
+      .toArray()
+  }
+
+  /** 任务行 → 策略字段（`updateJob` / 对账比较用）。 */
+  #policiesOf(row: JobRow): JobPolicies {
+    return {
+      misfire: row.misfire_policy as MisfirePolicy,
+      concurrency: row.concurrency_policy as ConcurrencyPolicy,
+      maxRetries: row.max_retries,
+      backoffSeconds: row.backoff_seconds,
+      timeoutSeconds: row.timeout_seconds,
+      jitterSeconds: row.jitter_seconds,
+    }
+  }
+
+  // ───────────────────── B4：项目管理与凭据（RPC） ─────────────────────
+
+  /**
+   * 新建项目：建项目行，并**同时**发放首个项目令牌与首把 signing key。
+   *
+   * 两把凭据互相独立：令牌用于调注册 API（只存哈希），signing key 用于回调验签
+   * （加密存 DO）。明文都只在本次应答里出现一次，之后任何接口都只给掩码/指纹。
+   */
+  async createProject(input: CreateProjectInput): Promise<WakerResult<CreateProjectResult>> {
+    try {
+      return ok(await this.#createProject(input))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  async #createProject(input: CreateProjectInput): Promise<CreateProjectResult> {
+    const now = Date.now()
+    const sql = this.ctx.storage.sql
+
+    const name = requireString(input?.name, 'name')
+    if (name.length > MAX_PROJECT_NAME_LENGTH) {
+      throw new WakerError('invalid_argument', `项目名最长 ${MAX_PROJECT_NAME_LENGTH} 字符`)
+    }
+    const callbackUrl = resolveCallbackBaseUrl(input?.callbackUrl)
+
+    if (findProjectRowByName(sql, name) !== null) {
+      throw new WakerError('duplicate_project', `项目名已存在：${name}`)
+    }
+
+    const projectId = crypto.randomUUID()
+    const token = generateProjectToken()
+    insertProject(sql, {
+      id: projectId,
+      name,
+      callbackUrl,
+      tokenHash: await hashProjectToken(token),
+      now,
+    })
+
+    const signingKey = await this.#issueSigningKey(projectId, now)
+    return { project: projectView(sql, requireProjectRow(sql, projectId)), token, signingKey }
+  }
+
+  /** 生成并加密存一把新 signing key（明文只在本函数返回体里出现）。 */
+  async #issueSigningKey(projectId: string, now: number): Promise<IssuedSigningKey> {
+    const secret = generateSigningSecret()
+    const envelope = await encryptSigningSecret(secret, await this.#requireKek())
+    const fingerprint = await signingSecretFingerprint(secret)
+    const id = crypto.randomUUID()
+
+    insertSigningKey(this.ctx.storage.sql, {
+      id,
+      projectId,
+      envelope,
+      fingerprint,
+      algorithm: SIGNING_ALGORITHM,
+      now,
+    })
+
+    return { id, algorithm: SIGNING_ALGORITHM, secret, fingerprint, createdAt: now }
+  }
+
+  /** 项目列表（单人自托管：项目数是个位数，不做分页）。 */
+  async listProjects(): Promise<WakerResult<ListProjectsResult>> {
+    try {
+      const sql = this.ctx.storage.sql
+      return ok({ projects: listProjectRows(sql).map((row) => projectView(sql, row)) })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /** 查单个项目；不存在返回 null（与 `getJob` 一致，不用抛错表达「没有」）。 */
+  async getProject(input: { projectId: string }): Promise<WakerResult<ProjectView | null>> {
+    try {
+      const sql = this.ctx.storage.sql
+      const projectId = requireString(input?.projectId, 'projectId')
+      const row = findProjectRow(sql, projectId)
+      return ok(row === null ? null : projectView(sql, row))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /** 改项目名 / 回调地址（凭据不在这个口子改，走两个独立轮换入口）。 */
+  async updateProject(input: UpdateProjectInput): Promise<WakerResult<ProjectView>> {
+    try {
+      const now = Date.now()
+      const sql = this.ctx.storage.sql
+      const projectId = requireString(input?.projectId, 'projectId')
+      requireProjectRow(sql, projectId)
+
+      const patch: { name?: string; callbackUrl?: string } = {}
+      if (input.name !== undefined) {
+        const name = requireString(input.name, 'name')
+        if (name.length > MAX_PROJECT_NAME_LENGTH) {
+          throw new WakerError('invalid_argument', `项目名最长 ${MAX_PROJECT_NAME_LENGTH} 字符`)
+        }
+        const clash = findProjectRowByName(sql, name)
+        if (clash !== null && clash.id !== projectId) {
+          throw new WakerError('duplicate_project', `项目名已存在：${name}`)
+        }
+        patch.name = name
+      }
+      if (input.callbackUrl !== undefined) {
+        patch.callbackUrl = resolveCallbackBaseUrl(input.callbackUrl)
+      }
+
+      updateProjectRow(sql, projectId, patch, now)
+      return ok(projectView(sql, requireProjectRow(sql, projectId)))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /** 轮换项目令牌：旧令牌立即失效（只覆盖哈希），新明文只在本次应答里出现一次。 */
+  async rotateProjectToken(
+    input: RotateProjectTokenInput,
+  ): Promise<WakerResult<RotateProjectTokenResult>> {
+    try {
+      const now = Date.now()
+      const sql = this.ctx.storage.sql
+      const projectId = requireString(input?.projectId, 'projectId')
+      requireProjectRow(sql, projectId)
+
+      const token = generateProjectToken()
+      updateProjectTokenHash(sql, projectId, await hashProjectToken(token), now)
+      return ok({ project: projectView(sql, requireProjectRow(sql, projectId)), token })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /** 轮换 signing key：旧 key 全部 `revoked_at`（保留行做审计），新 key 加密存库。 */
+  async rotateSigningKey(input: RotateSigningKeyInput): Promise<WakerResult<RotateSigningKeyResult>> {
+    try {
+      const now = Date.now()
+      const sql = this.ctx.storage.sql
+      const projectId = requireString(input?.projectId, 'projectId')
+      requireProjectRow(sql, projectId)
+
+      revokeSigningKeys(sql, projectId, now)
+      const signingKey = await this.#issueSigningKey(projectId, now)
+      return ok({ project: projectView(sql, requireProjectRow(sql, projectId)), signingKey })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /**
+   * 注册 API 鉴权：令牌 → 项目身份。
+   *
+   * 只在 DO 内部比对哈希（`sha256(token)` 直查唯一索引），明文令牌不落库、
+   * 不进日志；令牌无效或项目已停用时返回 null（调用方统一回 401，不区分原因）。
+   */
+  async verifyProjectToken(
+    input: VerifyProjectTokenInput,
+  ): Promise<WakerResult<ProjectAuthView | null>> {
+    try {
+      const sql = this.ctx.storage.sql
+      const token = requireString(input?.token, 'token')
+      const row = findProjectRowByTokenHash(sql, await hashProjectToken(token))
+      if (row === null || row.status !== 'active') return ok(null)
+      return ok({
+        projectId: row.id,
+        projectName: row.name,
+        callbackUrl: row.callback_url ?? '',
+      })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  /**
+   * 平台状态快照（管理面系统管理页只读数据）。
+   *
+   * 只报计数、时刻与 schema 版本：没有任何凭据、载荷或用户业务数据。
+   * `SETUP_SECRET` / `JWT_SECRET` 的「是否已配置」由 HTTP 层（能读 env 的那一层）补，
+   * DO 不接触也不需要知道这两个 secret 的值。
+   */
+  async getSystemStatus(): Promise<WakerResult<SystemStatusView>> {
+    try {
+      const sql = this.ctx.storage.sql
+      const count = (query: string): number => Number(sql.exec<{ n: number }>(query).one().n)
+      const lastRunAt = readMeta(sql, WATCHDOG_LAST_RUN_AT)
+      const lastDueJobs = readMeta(sql, WATCHDOG_LAST_DUE_JOBS)
+
+      return ok({
+        now: Date.now(),
+        schemaVersion: readSchemaVersion(sql),
+        watchdogLastRunAt: lastRunAt === null ? null : Number(lastRunAt),
+        watchdogLastDueJobs: lastDueJobs === null ? null : Number(lastDueJobs),
+        nextWakeAt: await this.ctx.storage.getAlarm(),
+        counts: {
+          projects: count('SELECT COUNT(*) AS n FROM projects'),
+          jobs: count('SELECT COUNT(*) AS n FROM jobs'),
+          activeJobs: count(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'active'`),
+          executions: count('SELECT COUNT(*) AS n FROM executions'),
+          pendingDispatches: count(`SELECT COUNT(*) AS n FROM executions WHERE status = 'pending'`),
+          deadLetters: count('SELECT COUNT(*) AS n FROM dead_letters'),
+        },
+      })
+    } catch (error) {
+      return toFailure(error)
     }
   }
 }

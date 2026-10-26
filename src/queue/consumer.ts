@@ -41,6 +41,7 @@ const PERMANENT_ERROR_CODES = new Set<string>([
   'execution_not_found',
   'job_not_found',
   'signing_key_missing',
+  'signing_key_unreadable',
   'callback_target_missing',
 ])
 

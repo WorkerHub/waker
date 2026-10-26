@@ -360,3 +360,205 @@ export interface ReplayDeadLetterResult {
   scheduledFor: number
   dispatchAt: number
 }
+
+// ───────────────────── B4：任务更新 / 项目管理 / 声明式清单 ─────────────────────
+//
+// 与 B3 相同的加法原则：B2 的方法表 / 出入参 / 错误码、B3 的执行引擎 RPC 一律不动，
+// 这里只新增 B4 需要的 RPC。新增错误码见 `errors.ts`（`project_not_found` /
+// `duplicate_project` / `name_conflict` / `signing_key_unreadable`）。
+
+/**
+ * 更新任务入参（B4 新增）。
+ *
+ * 为什么需要它：声明式清单对账要能改写已有的 cron 表达式 / 时区 / 策略；
+ * 管理面的「编辑任务」也要在不换 job id 的前提下改这些字段（换 id 会切断执行历史
+ * 与「同一 job 系列」的自续语义）。`kind` 与 `name` 不可改 —— name 是
+ * `(project_id, name)` 唯一键，改名等于换任务。
+ *
+ * 未出现的字段保持原值；`enabled` 是显式开关（`false` = 暂停，`true` = 恢复）。
+ */
+export interface UpdateJobInput {
+  jobId: string
+  /** 仅 `kind = 'cron'`：新的 CF 方言 5 字段表达式（按 B2 冻结方言校验）。 */
+  cron?: string
+  /** 仅 `kind = 'one_shot'`：新的执行时刻（epoch ms 或 ISO 8601）。 */
+  runAt?: number | string
+  /** 新时区（IANA）；cron 任务会按新时区重算下次执行时刻。 */
+  timezone?: string
+  /** 新载荷（不传 = 保持原值）。 */
+  payload?: JsonValue
+  /** 新的策略字段（整体覆盖，未传字段取 `DEFAULT_JOB_POLICIES`）。 */
+  policies?: Partial<JobPolicies>
+  /** `false` = 暂停；`true` = 恢复并重算下次执行时刻。 */
+  enabled?: boolean
+}
+
+/** 项目状态：单人所有者模型下的接入单元。 */
+export type ProjectStatus = 'active' | 'revoked'
+
+/** 当前生效 signing key 的**掩码视图**（明文只在发放/轮换应答里出现一次）。 */
+export interface ProjectSigningKeyView {
+  id: string
+  /** 签名算法，恒为 `HMAC-SHA256`（写进契约，便于日后轮换算法）。 */
+  algorithm: string
+  /** `sha256(secret)` 前 16 hex：只用于展示与人工比对，不能反推明文。 */
+  fingerprint: string
+  createdAt: number
+  rotatedAt: number | null
+}
+
+/**
+ * 项目视图（管理面列表 / 详情 / 创建 / 轮换的统一返回体）。
+ *
+ * 注意：这里**没有任何凭据明文** —— 令牌只给哈希掩码（`tokenFingerprint`），
+ * signing key 只给指纹。明文只在 `createProject` / `rotateProjectToken` /
+ * `rotateSigningKey` 的应答里出现一次。
+ */
+export interface ProjectView {
+  id: string
+  name: string
+  /** 项目根地址（平台拼 `/_waker/execute` 得到完整回调地址）。 */
+  callbackUrl: string
+  status: ProjectStatus
+  /** `sha256(token)` 前 16 hex；项目尚未发放令牌时为 null。 */
+  tokenFingerprint: string | null
+  tokenCreatedAt: number | null
+  tokenRotatedAt: number | null
+  /** 当前生效的 signing key（掩码视图）；项目尚未发放时为 null。 */
+  signingKey: ProjectSigningKeyView | null
+  createdAt: number
+  updatedAt: number
+}
+
+/** 新建项目：建项目本身，并**同时**发放首个令牌与首把 signing key。 */
+export interface CreateProjectInput {
+  name: string
+  /** 项目根地址（`https://your-worker.example.com`，可带 `/_waker/execute` 结尾）。 */
+  callbackUrl: string
+}
+
+/** 凭据明文：仅在发放 / 轮换的应答里出现一次。 */
+export interface IssuedSigningKey {
+  id: string
+  algorithm: string
+  /** 明文，仅此一次；平台侧只存 `waker-enc:v1:` 信封，绝不落明文。 */
+  secret: string
+  fingerprint: string
+  createdAt: number
+}
+
+export interface CreateProjectResult {
+  project: ProjectView
+  /** 项目令牌明文，仅此一次；平台侧只存 `sha256(token)`。 */
+  token: string
+  signingKey: IssuedSigningKey
+}
+
+export interface ListProjectsResult {
+  projects: ProjectView[]
+}
+
+/** 更新项目（改名 / 改回调地址）。凭据不在这里改，走两个独立轮换入口。 */
+export interface UpdateProjectInput {
+  projectId: string
+  name?: string
+  callbackUrl?: string
+}
+
+export interface RotateProjectTokenInput {
+  projectId: string
+}
+
+export interface RotateProjectTokenResult {
+  project: ProjectView
+  /** 新令牌明文，仅此一次；旧令牌立即失效。 */
+  token: string
+}
+
+export interface RotateSigningKeyInput {
+  projectId: string
+}
+
+export interface RotateSigningKeyResult {
+  project: ProjectView
+  /** 新 signing key 明文，仅此一次；旧 key 立即撤销（`revoked_at` 留痕）。 */
+  signingKey: IssuedSigningKey
+}
+
+/** 注册 API 鉴权：用令牌换项目身份（令牌只以哈希比对，DO 内部完成）。 */
+export interface VerifyProjectTokenInput {
+  token: string
+}
+
+/** 鉴权通过的项目身份（注册 API 只信这个，不信任请求体里的 projectId）。 */
+export interface ProjectAuthView {
+  projectId: string
+  projectName: string
+  callbackUrl: string
+}
+
+/** 声明式清单里的一条任务：只支持 cron（one-shot 是运行时动态创建/取消的）。 */
+export interface ManifestJobInput {
+  name: string
+  cron: string
+  timezone?: string
+  payload?: JsonValue
+  policies?: Partial<JobPolicies>
+  /** `false` = 声明但保持暂停（部署期先备好、暂不上线）。 */
+  enabled?: boolean
+}
+
+export interface SyncManifestInput {
+  projectId: string
+  jobs: ManifestJobInput[]
+}
+
+/**
+ * 清单对账结果。
+ *
+ * 对账范围：**该项目的声明式 cron 任务**（`kind = 'cron'`）。运行时 one-shot
+ * 不参与对账（见 `syncManifest` 实现注释）。
+ */
+export interface SyncManifestResult {
+  projectId: string
+  /** 本次新建的任务名。 */
+  created: string[]
+  /** 本次改写的任务名（含从暂停恢复、从取消复位）。 */
+  updated: string[]
+  /** 与清单完全一致、未动的任务名。 */
+  unchanged: string[]
+  /** 本次被停用（paused）的任务名：平台侧多出、清单里没有的 cron 任务。 */
+  paused: string[]
+  /** 对账后该项目全部 cron 任务的最新视图（供 CI / SDK 核对落库结果）。 */
+  jobs: JobView[]
+}
+
+// ───────────────────── B4：系统状态（watchdog / 存储 / 计数） ─────────────────────
+
+/**
+ * 平台状态快照（管理面「系统管理」页用）。
+ *
+ * 只报**状态位与计数**，不含任何凭据值：`SETUP_SECRET` / `JWT_SECRET` / signing key /
+ * 项目令牌一律不出现，连掩码都不给（它们的掩码另有专门接口）。
+ */
+export interface SystemStatusView {
+  /** 采集时刻（epoch ms）。 */
+  now: number
+  /** WakerDO 库内 schema 版本（= 迁移账本值）。 */
+  schemaVersion: number
+  /** watchdog（全仓唯一 Cron Trigger）上次 ping 到 DO 的时刻；从未跑过为 null。 */
+  watchdogLastRunAt: number | null
+  /** 本次 ping 处理到的到期任务数（watchdog 幂等，重复 ping 只会补漏）。 */
+  watchdogLastDueJobs: number | null
+  /** 当前 alarm 唤醒时刻（null = 没有待跑任务）。 */
+  nextWakeAt: number | null
+  counts: {
+    projects: number
+    jobs: number
+    activeJobs: number
+    executions: number
+    /** 等待投递的执行条数（>0 说明 Queue 投递落后）。 */
+    pendingDispatches: number
+    deadLetters: number
+  }
+}
