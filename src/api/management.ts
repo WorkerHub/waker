@@ -4,10 +4,15 @@ import { getApiStub } from '../do/http-rpc'
 import type {
   CreateJobInput,
   CreateProjectInput,
+  DeadLetterReplayState,
+  ExecutionStatus,
+  ExecutionTrigger,
   JobKind,
   JobPolicies,
   JobStatus,
   JsonValue,
+  ListDeadLettersQuery,
+  ListExecutionsQuery,
   ListJobsQuery,
   UpdateJobInput,
   UpdateProjectInput,
@@ -17,7 +22,8 @@ import { issueManagementSession, managementAuth } from './auth'
 import { jsonError, queryInt, queryValue, readJson, respond } from './errors'
 
 /**
- * 管理面 API（B4 冻结契约，供 F1「任务管理 / 项目管理」页与 F3「系统管理」页对接）。
+ * 管理面 API（B4 冻结契约，供 F1「任务管理 / 项目管理」页与 F3「系统管理」页对接；
+ * B7 追加执行记录 / 死信三条路由，供 F2 页面对接）。
  *
  * 鉴权：`POST /api/auth/setup` 用 `SETUP_SECRET` 换 12 小时会话 JWT，
  * 其余 `/api/*` 一律要求 `Authorization: Bearer <JWT>`（Hono 原生 `hono/jwt`）。
@@ -212,6 +218,52 @@ managementRoutes.post('/jobs/:jobId/:action', async (c) => {
     default:
       return jsonError(c, 'not_found', `未知动作：${action}（支持 pause / resume / cancel / trigger）`)
   }
+})
+
+// ───────────── 执行记录 / 死信（B6 + B3 冻结 RPC 的 HTTP 面，供 F2） ─────────────
+//
+// 三条路由都是**薄映射**：查询串 → B6 `listExecutions` / `listDeadLetters` 的入参对象；
+// 应答原样给出 `{ executions, nextCursor }` / `{ deadLetters, nextCursor }`，重放 202 直接回
+// `ReplayDeadLetterResult`（F2 页面已按此契约写定，字段不加壳、不改名）。
+//
+// 参数校验 / 排序 / 游标语义一律留在 WakerDO：HTTP 层不重复实现，否则会出现
+// 「HTTP 面放过、DO 拒绝」两套规则。`queryInt` 把非法数字解析成 `NaN` 交给 DO 报
+// `invalid_argument`（与既有 `GET /api/jobs` 同构），本层只做参数搬运 + 错误码映射。
+
+managementRoutes.get('/executions', async (c) => {
+  const query: ListExecutionsQuery = {
+    jobId: queryValue(c, 'jobId'),
+    projectId: queryValue(c, 'projectId'),
+    status: queryValue(c, 'status') as ExecutionStatus | undefined,
+    trigger: queryValue(c, 'trigger') as ExecutionTrigger | undefined,
+    scheduledFrom: queryInt(c, 'scheduledFrom'),
+    scheduledTo: queryInt(c, 'scheduledTo'),
+    limit: queryInt(c, 'limit'),
+    cursor: queryValue(c, 'cursor') ?? null,
+  }
+  return respond(c, await getApiStub(c.env).listExecutions(query), (value) => value)
+})
+
+managementRoutes.get('/dead-letters', async (c) => {
+  const query: ListDeadLettersQuery = {
+    jobId: queryValue(c, 'jobId'),
+    projectId: queryValue(c, 'projectId'),
+    replayState: queryValue(c, 'replayState') as DeadLetterReplayState | undefined,
+    createdFrom: queryInt(c, 'createdFrom'),
+    createdTo: queryInt(c, 'createdTo'),
+    limit: queryInt(c, 'limit'),
+    cursor: queryValue(c, 'cursor') ?? null,
+  }
+  return respond(c, await getApiStub(c.env).listDeadLetters(query), (value) => value)
+})
+
+/**
+ * 重放死信：以同一任务新建一条 `manual` 执行重新投递（语义全在 B3 `replayDeadLetter`）。
+ * body 按契约留空（有 body 也不解析，避免把「重放」变成可覆盖载荷的入口）。
+ */
+managementRoutes.post('/dead-letters/:deadLetterId/replay', async (c) => {
+  const deadLetterId = c.req.param('deadLetterId')
+  return respond(c, await getApiStub(c.env).replayDeadLetter({ deadLetterId }), (value) => value, 202)
 })
 
 // ───────────────────────── 系统状态（F3 系统管理页） ─────────────────────────

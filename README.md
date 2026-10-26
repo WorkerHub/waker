@@ -51,7 +51,7 @@ src/index.ts            Worker 入口（fetch / scheduled / queue）
 src/app.ts              Hono 路由表（/healthz + /v1 注册 API + /api 管理面 API）
 src/api/auth.ts         两套鉴权：项目令牌（bearerAuth）+ 管理面会话 JWT（hono/jwt）
 src/api/registration.ts 注册 API 路由（/v1/whoami /v1/jobs /v1/manifest）
-src/api/management.ts   管理面 API 路由（项目 / 凭据轮换 / 任务 / 系统状态）
+src/api/management.ts   管理面 API 路由（项目 / 凭据轮换 / 任务 / 执行记录与死信 / 系统状态）
 src/api/errors.ts       RPC 错误码 → HTTP 状态码与统一错误体
 src/do/waker-do.ts      WakerDO：任务生命周期 RPC + alarm tick + Queue 分发 + 执行结果回填/自续/死信
 src/do/schema.ts        SQLite 数据模型与迁移（版本账本在 waker_meta 表）
@@ -208,6 +208,7 @@ B6 追加（执行记录 / 死信查询，同样纯加法；只读，不改任�
 `job_cancelled` / `job_not_resumable` / `execution_not_found` / `dead_letter_not_found` /
 `signing_key_missing` / `signing_key_unreadable` / `callback_target_missing` / `internal`。
 B6 只用到 `invalid_argument`（两个查询都是只读、无「找不到」语义）。
+这两条 RPC 的 HTTP 面是 `GET /api/executions` / `GET /api/dead-letters`（B7，见管理面 API 表）。
 类型定义见 `src/do/types.ts`；调度器内部调用用 `unwrap()` 拆信封。
 
 ## 注册 API（B4 冻结，供 B5 SDK / CI 对齐）
@@ -262,6 +263,9 @@ cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 
 | PATCH | `/api/jobs/{id}` | `{ cron?, runAt?, timezone?, payload?, policies?, enabled? }` → `{ job }` |
 | POST | `/api/jobs/{id}/{pause\|resume\|cancel}` | `{ job }` |
 | POST | `/api/jobs/{id}/trigger` | 202 `{ jobId, executionId, scheduledFor, dispatchAt }` |
+| GET | `/api/executions?...` | `{ executions, nextCursor }`（同 B6 `listExecutions`，B7 挂载） |
+| GET | `/api/dead-letters?...` | `{ deadLetters, nextCursor }`（同 B6 `listDeadLetters`，B7 挂载） |
+| POST | `/api/dead-letters/{id}/replay` | 202 `ReplayDeadLetterResult`（同 B3 `replayDeadLetter`，B7 挂载） |
 | GET | `/api/system/status` | watchdog 上次校正 / schema 版本 / 计数 / 密钥状态位（只读，不含值） |
 
 凭据规则（两条硬要求）：
@@ -276,9 +280,12 @@ cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 
 错误体固定为 `{ "error": { "code", "message", "details"? } }`，`code` 与 RPC 错误码一一对应
 （B4 新增 `project_not_found` / `duplicate_project` / `name_conflict` / `signing_key_unreadable`）。
 
-未挂载的管理面子路径（如 `/api/executions`、`/api/dead-letters`）仍回 501 `not_implemented`：
-B6 的 `listExecutions` / `listDeadLetters` 查询 RPC 已就位并有测试覆盖，HTTP 路由由后续管理面单挂载
-（本单范围只有 DO 查询 RPC，不动管理面路由）。
+执行记录 / 死信三条路由是**薄映射**（B7）：查询串原样下推给 B6 的 `listExecutions` /
+`listDeadLetters`，重放转给 B3 的 `replayDeadLetter`；参数校验、排序、keyset 游标语义全部留在
+WakerDO（`src/do/input.ts`），HTTP 层只做参数搬运 + 错误码映射，不改任何业务语义。
+
+仍未挂载的管理面子路径（如 `/api/metrics`）继续回 501 `not_implemented`：那是「还没做」的信号，
+与「路径不存在」（404）分开。
 
 ## 本地开发
 
@@ -301,6 +308,9 @@ B4 的用例：
   （真路由、真中间件、真鉴权），并同时断言库里的真实形态（令牌只存哈希、signing key 只存密文）；
   最后一条是端到端：建项目拿明文 key → 改回调地址 → 建任务 → 手动触发 → 下游用那份明文验签通过。
 - `tests/keyring.test.ts`：令牌生成/哈希/掩码、AES-GCM 信封往返、换密钥与密文篡改必须解不开（fail closed）。
+- `tests/management-executions.test.ts`（B7）：三条管理面 HTTP 路由的正 / 负路径——筛选 / 半开区间 /
+  `limit` + `cursor` 翻页、应答形状逐字对齐契约，以及区间倒置 / 非法枚举 / 非法 limit / 非法 cursor /
+  死信不存在 / 任务已取消的状态码与错误码；重放用例还会等下真 Queue → 下游回调并验签。
 - 测试用 `SETUP_SECRET` / `JWT_SECRET` 由 `createTestHarness` 的 `secrets` 选项注入（占位值），
   与线上 `wrangler deploy --secrets-file` 注入的是同一组绑定名，代码路径一致。
 

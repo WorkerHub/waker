@@ -21,7 +21,7 @@ app.get('/healthz', (c) => c.json({ ok: true, service: 'waker' }))
 app.route('/v1', registrationRoutes)
 app.route('/api', managementRoutes)
 
-/** 兜底：已挂载路由之外的管理面 / 注册面路径（如执行记录、死信列表，等 B6 的查询 RPC）。 */
+/** 兜底：已挂载路由之外的管理面 / 注册面路径。 */
 app.all('/api/*', (c) => c.json({ error: 'not_implemented', scope: 'management-api' }, 501))
 app.all('/v1/*', (c) => c.json({ error: 'not_implemented', scope: 'registration-api' }, 501))
 

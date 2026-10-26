@@ -6,6 +6,10 @@ import type {
   CreateProjectResult,
   JobRef,
   JobView,
+  ListDeadLettersQuery,
+  ListDeadLettersResult,
+  ListExecutionsQuery,
+  ListExecutionsResult,
   ListJobsQuery,
   ListJobsResult,
   ListProjectsResult,
@@ -13,6 +17,8 @@ import type {
   ManualTriggerResult,
   ProjectAuthView,
   ProjectView,
+  ReplayDeadLetterInput,
+  ReplayDeadLetterResult,
   RotateProjectTokenInput,
   RotateProjectTokenResult,
   RotateSigningKeyInput,
@@ -46,6 +52,11 @@ export interface WakerApiRpc {
   manualTrigger(input: ManualTriggerInput): Promise<WakerResult<ManualTriggerResult>>
   getJob(ref: JobRef): Promise<WakerResult<JobView | null>>
   listJobs(query?: ListJobsQuery): Promise<WakerResult<ListJobsResult>>
+  // B6 新增：执行记录 / 死信查询（B7 挂到 HTTP 面）
+  listExecutions(query?: ListExecutionsQuery): Promise<WakerResult<ListExecutionsResult>>
+  listDeadLetters(query?: ListDeadLettersQuery): Promise<WakerResult<ListDeadLettersResult>>
+  // B3 新增：死信重放（B7 挂到 HTTP 面）
+  replayDeadLetter(input: ReplayDeadLetterInput): Promise<WakerResult<ReplayDeadLetterResult>>
   // B4 新增：编辑任务 / 声明式对账
   updateJob(input: UpdateJobInput): Promise<WakerResult<JobView>>
   syncManifest(input: SyncManifestInput): Promise<WakerResult<SyncManifestResult>>
