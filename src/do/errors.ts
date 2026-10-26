@@ -7,10 +7,15 @@ import type { WakerResult } from './types'
  * 语义：
  *   - `invalid_*`：调用方入参问题（HTTP 400）
  *   - `duplicate_job`：同项目下任务名冲突（HTTP 409）
- *   - `job_not_found` / `execution_not_found` / `dead_letter_not_found`：目标不存在（HTTP 404）
+ *   - `duplicate_project`：项目名冲突（B4 新增，HTTP 409）
+ *   - `name_conflict`：声明式清单里的名字被另一类任务占用（B4 新增，HTTP 409）
+ *   - `job_not_found` / `execution_not_found` / `dead_letter_not_found` / `project_not_found`：
+ *     目标不存在（HTTP 404；`project_not_found` 为 B4 新增）
  *   - `job_cancelled` / `job_not_resumable`：状态冲突（HTTP 409）
  *   - `signing_key_missing` / `callback_target_missing`：项目接入配置缺失（B3 新增，HTTP 409，
  *     执行侧遇到时直接判死进死信，不用同一必败原因重试）
+ *   - `signing_key_unreadable`：库里的 signing key 解不开（B4 新增，HTTP 500；换过 JWT_SECRET
+ *     或写入来源不合法导致，同样直接进死信不重试）
  *   - `internal`：平台内部错误（HTTP 500），调用方可重试
  *
  * B4（注册 API / 管理面）把 code 原样映射成 HTTP 错误体
@@ -23,12 +28,16 @@ export type WakerErrorCode =
   | 'invalid_run_at'
   | 'invalid_policy'
   | 'duplicate_job'
+  | 'duplicate_project'
+  | 'name_conflict'
   | 'job_not_found'
+  | 'project_not_found'
   | 'job_cancelled'
   | 'job_not_resumable'
   | 'execution_not_found'
   | 'dead_letter_not_found'
   | 'signing_key_missing'
+  | 'signing_key_unreadable'
   | 'callback_target_missing'
   | 'internal'
 

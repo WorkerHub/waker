@@ -135,6 +135,22 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE executions ADD COLUMN renewal_error TEXT;
     `,
   },
+  {
+    version: 3,
+    sql: `
+      -- ── B4 项目管理：凭据（令牌 / signing key）的落库形态 ──
+      -- 项目令牌只存 sha256 哈希（列已存在于 v1，这里只补唯一索引与轮换时间账本）。
+      -- 唯一索引让鉴权可以“哈希直查”，不需要遍历全部项目。
+      ALTER TABLE projects ADD COLUMN token_rotated_at INTEGER;
+      CREATE UNIQUE INDEX projects_token_hash ON projects (token_hash) WHERE token_hash IS NOT NULL;
+
+      -- signing key 自成 v3 起以 AES-256-GCM 信封存储（信封前缀见 src/do/keyring.ts）；
+      -- 明文不再落库；fingerprint 是对明文的 sha256 前 16 hex，只用于展示与人工比对；
+      -- algorithm 写进库，日后换算法时不需要猜。
+      ALTER TABLE signing_keys ADD COLUMN fingerprint TEXT;
+      ALTER TABLE signing_keys ADD COLUMN algorithm TEXT NOT NULL DEFAULT 'HMAC-SHA256';
+    `,
+  },
 ]
 
 /** 当前代码期望的 schema 版本。 */
@@ -145,22 +161,29 @@ const META_TABLE_SQL = `CREATE TABLE IF NOT EXISTS waker_meta (key TEXT PRIMARY 
 
 const SCHEMA_VERSION_KEY = 'schema_version'
 
-/** 读取库内当前 schema 版本；空库返回 0。 */
-export function readSchemaVersion(sql: SqlStorage): number {
+/** 读账本里的任意键（schema 版本、watchdog 上次校正等）；不存在返回 null。 */
+export function readMeta(sql: SqlStorage, key: string): string | null {
   sql.exec(META_TABLE_SQL)
   const rows = sql
-    .exec<{ value: string }>('SELECT value FROM waker_meta WHERE key = ?', SCHEMA_VERSION_KEY)
+    .exec<{ value: string }>('SELECT value FROM waker_meta WHERE key = ?', key)
     .toArray()
-  const raw = rows[0]?.value
-  return raw === undefined ? 0 : Number(raw)
+  return rows[0]?.value ?? null
+}
+
+/** 写账本键（`INSERT OR REPLACE`，幂等）。 */
+export function writeMeta(sql: SqlStorage, key: string, value: string): void {
+  sql.exec(META_TABLE_SQL)
+  sql.exec(`INSERT OR REPLACE INTO waker_meta (key, value) VALUES (?, ?)`, key, value)
+}
+
+/** 读取库内当前 schema 版本；空库返回 0。 */
+export function readSchemaVersion(sql: SqlStorage): number {
+  const raw = readMeta(sql, SCHEMA_VERSION_KEY)
+  return raw === null ? 0 : Number(raw)
 }
 
 function writeSchemaVersion(sql: SqlStorage, version: number): void {
-  sql.exec(
-    `INSERT OR REPLACE INTO waker_meta (key, value) VALUES (?, ?)`,
-    SCHEMA_VERSION_KEY,
-    String(version),
-  )
+  writeMeta(sql, SCHEMA_VERSION_KEY, String(version))
 }
 
 /**

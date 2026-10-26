@@ -26,6 +26,9 @@ export const MAX_LIST_LIMIT = 200
 
 export const MAX_NAME_LENGTH = 200
 
+/** 项目名长度上限（管理面展示用，与任务名分开限）。 */
+export const MAX_PROJECT_NAME_LENGTH = 100
+
 const POLICY_LIMITS = {
   maxRetries: [0, 100],
   backoffSeconds: [0, 86_400],
@@ -193,4 +196,24 @@ export function decodeCursor(raw: string): { nextRunAt: number | null; id: strin
 
 export function describeRef(ref: JobRef): string {
   return 'jobId' in ref ? `任务不存在：${ref.jobId}` : `任务不存在：${ref.projectId}/${ref.name}`
+}
+
+/**
+ * 校验项目回调根地址：必须是绝对 http(s) URL。
+ *
+ * 值不在这里拼 `/_waker/execute`（那是执行期 `resolveCallbackUrl` 的事）：
+ * 库里存的就是开发者填的项目根地址，管理面原样展示，拼路径只发生在回调时。
+ */
+export function resolveCallbackBaseUrl(value: unknown): string {
+  const raw = requireString(value, 'callbackUrl')
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new WakerError('invalid_argument', `callbackUrl 必须是绝对 URL：${raw}`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new WakerError('invalid_argument', `callbackUrl 只支持 http/https，实际：${parsed.protocol}`)
+  }
+  return raw
 }

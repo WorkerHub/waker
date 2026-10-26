@@ -1,4 +1,4 @@
-import type { MisfirePolicy } from './types'
+import type { JobPolicies, MisfirePolicy } from './types'
 
 /**
  * 调度策略的纯逻辑：错过窗口判定、补跑决策、抖动打散。
@@ -84,4 +84,21 @@ export function jitterOffsetMs(jobId: string, scheduledFor: number, jitterSecond
     hash = Math.imul(hash, 0x01000193) >>> 0
   }
   return hash % (span + 1)
+}
+
+/**
+ * 策略字段是否完全一致（声明式对账用）。
+ *
+ * 逐字段比较而不是 `JSON.stringify`：策略对象字段顺序在库里与清单里不一定相同，
+ * 序列化比较会把「同一条策略」误判成变更，导致每次 CI 对账都 rewrite 一遍。
+ */
+export function policiesEqual(a: JobPolicies, b: JobPolicies): boolean {
+  return (
+    a.misfire === b.misfire &&
+    a.concurrency === b.concurrency &&
+    a.maxRetries === b.maxRetries &&
+    a.backoffSeconds === b.backoffSeconds &&
+    a.timeoutSeconds === b.timeoutSeconds &&
+    a.jitterSeconds === b.jitterSeconds
+  )
 }

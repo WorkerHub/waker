@@ -14,6 +14,11 @@ import type {
 } from '../../src/do/types'
 import { verifyCallbackSignature } from '../../src/callback/sign'
 import { getEngineStub, type WakerEngineRpc } from '../../src/do/engine-rpc'
+import {
+  deriveSigningKeyKek,
+  encryptSigningSecret,
+  signingSecretFingerprint,
+} from '../../src/do/keyring'
 import { CALLBACK_HEADERS, type CallbackRequestBody } from '../../src/callback/protocol'
 import type { Env } from '../../src/env'
 
@@ -27,6 +32,15 @@ import type { Env } from '../../src/env'
  */
 
 const INSTANCE_NAME = 'waker'
+
+/**
+ * 测试用 secrets（占位值，不是真实凭据）。
+ *
+ * 走 `createTestHarness` 的 `secrets` 选项注入到 workerd 的 env —— 与线上
+ * `wrangler deploy --secrets-file` 注入的是同一组绑定名，代码路径完全一致。
+ */
+export const TEST_SETUP_SECRET = 'test-setup-secret-placeholder'
+export const TEST_JWT_SECRET = 'test-jwt-secret-placeholder'
 
 /** 冻结 RPC 契约（测试侧独立声明，B2 用法一致）。 */
 export interface WakerRpcContract {
@@ -55,7 +69,14 @@ export interface TestContext {
 }
 
 export async function startHarness(): Promise<TestContext> {
-  const harness = createTestHarness({ workers: [{ configPath: './wrangler.toml' }] })
+  const harness = createTestHarness({
+    workers: [
+      {
+        configPath: './wrangler.toml',
+        secrets: { SETUP_SECRET: TEST_SETUP_SECRET, JWT_SECRET: TEST_JWT_SECRET },
+      },
+    ],
+  })
   await harness.listen()
   const worker = harness.getWorker<Env>()
   const env = await worker.getEnv()
@@ -203,7 +224,13 @@ export async function startDownstream(secret: string): Promise<Downstream> {
 let projectCounter = 0
 let jobCounter = 0
 
-/** 建项目 + 发 signing key（B4 的语义，这里是测试侧直接落库）。 */
+/**
+ * 建项目 + 发 signing key（测试侧直接落库，但**按线上同一形态**写：
+ * signing key 存 AES-GCM 信封，由 harness 的 JWT_SECRET 派生 KEK）。
+ *
+ * 这样 B3 的执行引擎用例仍然用调用方指定的明文 secret 验签，
+ * 同时真正走过「库里是密文 → DO 内部解密 → 签名」这条路径。
+ */
 export async function seedProject(
   ctx: TestContext,
   options: { callbackUrl: string; secret: string; name?: string },
@@ -223,15 +250,69 @@ export async function seedProject(
     now,
     now,
   )
+
+  const kek = await deriveSigningKeyKek(TEST_JWT_SECRET)
   await ctx.sql.exec(
-    `INSERT INTO signing_keys (id, project_id, secret, created_at) VALUES (?, ?, ?, ?)`,
+    `INSERT INTO signing_keys (id, project_id, secret, fingerprint, algorithm, created_at)
+     VALUES (?, ?, ?, ?, 'HMAC-SHA256', ?)`,
     signingKeyId,
     projectId,
-    options.secret,
+    await encryptSigningSecret(options.secret, kek),
+    await signingSecretFingerprint(options.secret),
     now,
   )
 
   return { projectId, projectName, signingKeyId, secret: options.secret }
+}
+
+/** 一次 HTTP 调用的结果（状态码 + 解析后的 JSON body）。 */
+export interface HttpResult<T = unknown> {
+  status: number
+  body: T
+}
+
+/**
+ * 经真 workerd 的 HTTP 入口打一次请求（`worker.fetch`），返回状态码与 JSON。
+ *
+ * 注册 / 管理面 API 的用例全走这里：路由、中间件、鉴权、错误映射都是真跑的，
+ * 不是直接调 handler 函数。
+ */
+export async function http<T = unknown>(
+  ctx: TestContext,
+  path: string,
+  init: {
+    method?: string
+    token?: string
+    body?: unknown
+    headers?: Record<string, string>
+  } = {},
+): Promise<HttpResult<T>> {
+  const headers: Record<string, string> = { ...(init.headers ?? {}) }
+  if (init.token !== undefined) headers.authorization = `Bearer ${init.token}`
+  if (init.body !== undefined) headers['content-type'] = 'application/json'
+
+  const response = await ctx.worker.fetch(path, {
+    method: init.method ?? 'GET',
+    headers,
+    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+  })
+
+  const text = await response.text()
+  const parsed = text.length === 0 ? null : (JSON.parse(text) as T)
+  return { status: response.status, body: parsed as T }
+}
+
+/** 管理面会话：用 SETUP_SECRET 换 JWT（每个测试文件换一次即可）。 */
+export async function managementToken(ctx: TestContext): Promise<string> {
+  const result = await http<{ session: { token: string; expiresAt: number } }>(
+    ctx,
+    '/api/auth/setup',
+    { method: 'POST', body: { setupSecret: TEST_SETUP_SECRET } },
+  )
+  if (result.status !== 200) {
+    throw new Error(`换管理面会话失败（${result.status}）：${JSON.stringify(result.body)}`)
+  }
+  return result.body.session.token
 }
 
 /** 建任务（走真实 RPC）。 */

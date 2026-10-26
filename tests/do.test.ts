@@ -162,8 +162,9 @@ describe('数据模型：DO 启动即建好 SQLite 表', () => {
 
     // 版本账本在 waker_meta 里（DO 的 SQLite 不允许读写 PRAGMA user_version）
     // v2 = B3 追加（projects.callback_url + executions.signing_key_id/renewal_at/renewal_error）。
+    // v3 = B4 追加（projects.token_rotated_at + signing_keys.fingerprint/algorithm）。
     const version = await sql.exec(`SELECT value FROM waker_meta WHERE key = 'schema_version'`)
-    expect(Number(version[0]!.value)).toBe(2)
+    expect(Number(version[0]!.value)).toBe(3)
   })
 })
 
