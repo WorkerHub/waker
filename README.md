@@ -8,7 +8,8 @@
 
 > 当前状态：**调度内核 + 执行引擎已就位（B1 + B2 + B3）**。WakerDO 的 SQLite 数据模型、任务生命周期 RPC、
 > alarm 自愈、CF 方言 cron 解析器，以及 Queue 分发 → 同步回调（HMAC 签名）→ 重试/死信 → 自续的整条执行链路
-> 已完成并有测试覆盖；注册 API 与凭据（B4）、管理面与前端（F1-F3）、SDK（B5）仍为后续子单。
+> 已完成并有测试覆盖；注册 API 与凭据（B4）、执行记录 / 死信查询 RPC（B6）、管理面与前端（F1-F3）、
+> SDK（B5）仍为后续子单。
 
 ## 架构（骨架已定型）
 
@@ -178,10 +179,35 @@ B4 追加（任务更新 / 清单对账 / 项目管理，仍是纯加法，B2/B3
 | `verifyProjectToken` | `{ token }` | `{ projectId, projectName, callbackUrl } \| null` |
 | `getSystemStatus` | — | `{ now, schemaVersion, watchdogLastRunAt, watchdogLastDueJobs, nextWakeAt, counts }` |
 
+B6 追加（执行记录 / 死信查询，同样纯加法；只读，不改任何行）：
+
+| 方法 | 入参 | 成功返回值 |
+|---|---|---|
+| `listExecutions` | `{ jobId?, projectId?, status?, trigger?, scheduledFrom?, scheduledTo?, limit?, cursor? }` | `{ executions: ExecutionView[], nextCursor }` |
+| `listDeadLetters` | `{ jobId?, projectId?, replayState?, createdFrom?, createdTo?, limit?, cursor? }` | `{ deadLetters: DeadLetterView[], nextCursor }` |
+
+查询语义（冻结，F2 按此对接）：
+
+- **排序**：`listExecutions` = `scheduledFor DESC, id DESC`（最近的排最前；`scheduledFor` 是不可变列，
+  翻页期间执行完成不会让已翻过的行动位）；`listDeadLetters` = **未重放优先** → `createdAt DESC` → `id DESC`
+  （死信页第一屏是还没人管的那些，已重放的按死亡时刻倒序留痕）。
+- **分页**：keyset 游标，`nextCursor` 原样回传即可；默认 `limit = 50`、上限 `200`（与 `listJobs` 一致）；
+  `id` 是同一时刻多条时的稳定 tiebreak。死信分桶用的是可空列 `replayed_at`，游标里带桶标记
+  （`p` / `r`）：游标落在未重放桶时桶内续页再接上已重放桶，落在已重放桶时只续该桶——
+  这就是 B2 复评 blocking 修复的 NULL 区间语义，不会每页从头返回第 1 页。
+- **时间区间**一律半开 `[from, to)`：`from` 含、`to` 不含（按天分页不会把 00:00:00.000 算两次）；
+  `from > to` 报 `invalid_argument`，`from === to` 是合法空区间。
+- **筛选值校验**：`status` / `trigger` / `replayState` 只收固定枚举，写错报 `invalid_argument`
+  （不是静默返回空列表——否则「参数错了」会被伪装成「没有数据」）。
+- `ExecutionView` 含时间 / 任务（`jobId` + 联表 `jobName`）/ 状态 / 耗时 / 重试次数（`attempt`）/
+  错误信息 / 自续结果；**不含 `payload` 与 `signingKeyId`**（载荷不随列表批量下发）。
+  死信条目复用 B3 的 `DeadLetterView`（含 `payload`、`replayedAt`、`replayedExecutionId`）。
+
 错误码：`invalid_argument` / `invalid_cron` / `invalid_timezone` / `invalid_run_at` / `invalid_policy` /
 `duplicate_job` / `duplicate_project` / `name_conflict` / `job_not_found` / `project_not_found` /
 `job_cancelled` / `job_not_resumable` / `execution_not_found` / `dead_letter_not_found` /
 `signing_key_missing` / `signing_key_unreadable` / `callback_target_missing` / `internal`。
+B6 只用到 `invalid_argument`（两个查询都是只读、无「找不到」语义）。
 类型定义见 `src/do/types.ts`；调度器内部调用用 `unwrap()` 拆信封。
 
 ## 注册 API（B4 冻结，供 B5 SDK / CI 对齐）
@@ -251,7 +277,8 @@ cron 校验复用 B2 冻结的 CF 方言解析器（`src/cron/`），注册 API 
 （B4 新增 `project_not_found` / `duplicate_project` / `name_conflict` / `signing_key_unreadable`）。
 
 未挂载的管理面子路径（如 `/api/executions`、`/api/dead-letters`）仍回 501 `not_implemented`：
-它们依赖 B6 的 `listExecutions` / `listDeadLetters` 查询 RPC。
+B6 的 `listExecutions` / `listDeadLetters` 查询 RPC 已就位并有测试覆盖，HTTP 路由由后续管理面单挂载
+（本单范围只有 DO 查询 RPC，不动管理面路由）。
 
 ## 本地开发
 
@@ -307,5 +334,5 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 | B2 | WakerDO 数据模型 + 任务生命周期 RPC + CF 方言 cron 解析器 |
 | B6 | 查询 RPC：`listExecutions` / `listDeadLetters`（执行记录页 / 死信页） |
 | B3 | 执行引擎：Queue 分发 + 回调协议 v2（HMAC）+ 重试/DLQ + 自续 |
-| B4（本单） | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
+| B4 | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
 | F1-F3 / B5 | 管理面前端、客户端 SDK |
