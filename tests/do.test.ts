@@ -319,6 +319,10 @@ describe('任务 CRUD 与策略字段读写', () => {
       'invalid_policy',
     )
     await expectFailure(
+      stub.createJob(cronJob({ policies: [] as never })),
+      'invalid_policy',
+    )
+    await expectFailure(
       stub.createJob({
         projectId: 'proj-test',
         name: uniqueName('bad-runat'),
@@ -393,8 +397,20 @@ describe('cron 方言落地（经 RPC 走完整链路）', () => {
     }
   })
 
-  it('非法时区报 invalid_timezone', async () => {
+  it('非法时区报 invalid_timezone（cron 与 one_shot 都校验）', async () => {
     await expectFailure(stub.createJob(cronJob({ timezone: 'Mars/Base' })), 'invalid_timezone')
+
+    // one_shot 以前只在 cron 分支校验，非法时区会静默入库；回归用例钉住这条。
+    await expectFailure(
+      stub.createJob({
+        projectId: 'proj-test',
+        name: uniqueName('oneshot-badtz'),
+        kind: 'one_shot',
+        runAt: Date.now() + 600_000,
+        timezone: 'Mars/Base',
+      }),
+      'invalid_timezone',
+    )
   })
 
   it('CF 扩展形式在 DO 里算出的执行时刻正确（LW / friL / MON#1）', async () => {
@@ -454,6 +470,57 @@ describe('next_run_at 排序查询', () => {
     expect(secondPage.jobs[1]!.id).toBe(paused.id)
     expect(secondPage.jobs[0]!.nextRunAt!).toBeGreaterThan(middle.nextRunAt!)
     expect(secondPage.jobs[0]!.nextRunAt!).toBeGreaterThan(early.nextRunAt!)
+  })
+
+  it('游标翻进 NULL 区间后只在该区间续页：多条无下次执行的任务能一路翻到末尾', async () => {
+    const projectId = uniqueName('proj-null-cursor')
+    const now = Date.now()
+
+    // 2 条活跃（有 next_run_at）+ 3 条暂停（next_run_at 为 NULL，排序里排最后）
+    const activeIds = [
+      unwrapResult(
+        await stub.createJob({ projectId, name: 'a1', kind: 'one_shot', runAt: now + 60_000 }),
+      ).id,
+      unwrapResult(
+        await stub.createJob({ projectId, name: 'a2', kind: 'one_shot', runAt: now + 120_000 }),
+      ).id,
+    ]
+    const pausedIds = ['p1', 'p2', 'p3'].map((name) => name)
+    for (const name of pausedIds) {
+      unwrapResult(
+        await stub.createJob({
+          projectId,
+          name,
+          kind: 'cron',
+          cron: '0 6 * * *',
+          enabled: false,
+        }),
+      )
+    }
+
+    const seen: string[] = []
+    let cursor: string | null = null
+    let pages = 0
+
+    do {
+      const page: ListJobsResult = unwrapResult(
+        await stub.listJobs({ projectId, limit: 2, cursor }),
+      )
+      pages += 1
+      expect(page.jobs.length).toBeGreaterThan(0)
+      seen.push(...page.jobs.map((job) => job.name))
+      cursor = page.nextCursor
+      // 死循环兜底：5 条任务、每页 2 条，最多 3 页
+      expect(pages).toBeLessThanOrEqual(3)
+    } while (cursor !== null)
+
+    expect(pages).toBe(3)
+    // 非 NULL 区间按 next_run_at 升序；NULL 区间排在最后、按 id 升序（id 是随机 uuid，
+    // 所以这里不断言暂停任务的相对顺序，只断言集合与「无重复、翻到末尾」）
+    expect(seen.slice(0, 2)).toEqual(['a1', 'a2'])
+    expect(seen.slice(2).sort()).toEqual(['p1', 'p2', 'p3'])
+    expect(new Set(seen).size).toBe(5)
+    expect(activeIds).toHaveLength(2)
   })
 
   it('支持按 status / kind 过滤', async () => {

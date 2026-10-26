@@ -38,7 +38,31 @@ export interface CronSchedule {
   nextAfterN(afterMs: number, count: number): number[]
 }
 
+/**
+ * 引擎缓存（表达式 + 时区 → croner 实例）。
+ *
+ * DO 是长生命周期实例，表达式来自任务表且原则上有限；但仍给容量上限做 LRU 淘汰，
+ * 避免异常输入（例如被反复创建/删除的不同表达式）把内存顶上去。
+ * `Map` 的插入顺序即 LRU 顺序：命中后重新插入以刷新最近使用位置。
+ */
 const ENGINE_CACHE = new Map<string, Cron>()
+
+/** 引擎缓存容量上限。 */
+export const CRON_ENGINE_CACHE_LIMIT = 500
+
+/** 当前缓存的引擎数量（诊断 / 测试用）。 */
+export function cronEngineCacheSize(): number {
+  return ENGINE_CACHE.size
+}
+
+function cacheEngine(key: string, engine: Cron): void {
+  ENGINE_CACHE.set(key, engine)
+  while (ENGINE_CACHE.size > CRON_ENGINE_CACHE_LIMIT) {
+    const oldest = ENGINE_CACHE.keys().next()
+    if (oldest.done === true) break
+    ENGINE_CACHE.delete(oldest.value)
+  }
+}
 
 /** 校验 IANA 时区名（非法抛 cron_invalid_timezone）。 */
 export function assertTimezone(timezone: string): void {
@@ -71,7 +95,11 @@ export function createCronSchedule(
   const cacheKey = `${parsed.normalized}|${timezone}`
 
   let engine = ENGINE_CACHE.get(cacheKey)
-  if (!engine) {
+  if (engine !== undefined) {
+    // 命中后刷新 LRU 位置（删除再插入到队尾）
+    ENGINE_CACHE.delete(cacheKey)
+    cacheEngine(cacheKey, engine)
+  } else {
     try {
       engine = new Cron(parsed.normalized, { ...CRONER_OPTIONS, timezone })
     } catch (error) {
@@ -83,7 +111,7 @@ export function createCronSchedule(
         `表达式通过 CF 方言校验但引擎无法计算：${parsed.normalized}（${reason}）`,
       )
     }
-    ENGINE_CACHE.set(cacheKey, engine)
+    cacheEngine(cacheKey, engine)
   }
 
   const nextAfter = (afterMs: number): number | null => {

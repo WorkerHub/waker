@@ -13,6 +13,7 @@ import {
   normalizePayload,
   requireString,
   resolvePolicies,
+  resolveTimezone,
   toEpochMs,
 } from './input'
 import { MAX_CATCH_UP_OCCURRENCES, jitterOffsetMs, planOccurrences } from './policies'
@@ -133,7 +134,7 @@ export class WakerDO extends DurableObject<Env> {
       throw new WakerError('invalid_argument', "kind 必须是 'cron' 或 'one_shot'")
     }
 
-    const timezone = input.timezone === undefined ? 'UTC' : requireString(input.timezone, 'timezone')
+    const timezone = resolveTimezone(input.timezone)
     const payload = normalizePayload(input.payload)
     const policies = resolvePolicies(input.policies)
     const enabled = input.enabled !== false
@@ -371,8 +372,9 @@ export class WakerDO extends DurableObject<Env> {
     if (query.cursor !== undefined && query.cursor !== null) {
       const cursor = decodeCursor(query.cursor)
       if (cursor.nextRunAt === null) {
-        // 已进入「无下次执行」区间：NULL 区间内按 id 续页，非 NULL 区间不会再有。
-        where.push(`((next_run_at IS NULL AND id > ?) OR next_run_at IS NOT NULL)`)
+        // 已进入「无下次执行」区间：只在该区间内按 id 续页。
+        // 不能再 OR 出非 NULL 行，否则每页都会从头返回第 1 页、翻页死循环。
+        where.push(`next_run_at IS NULL AND id > ?`)
         bindings.push(cursor.id)
       } else {
         // 非 NULL 区间之后还有「无下次执行」的 NULL 区间（排序里排在最后），一并接上。

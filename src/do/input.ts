@@ -1,4 +1,9 @@
-import { CronDialectError, createCronSchedule, type CronSchedule } from '../cron'
+import {
+  CronDialectError,
+  assertTimezone,
+  createCronSchedule,
+  type CronSchedule,
+} from '../cron'
 import { WakerError } from './errors'
 import {
   DEFAULT_JOB_POLICIES,
@@ -38,6 +43,20 @@ export function requireString(value: unknown, field: string): string {
   return value.trim()
 }
 
+/** 解析并校验 IANA 时区（cron / one_shot 两类任务都必须校验），默认 UTC。 */
+export function resolveTimezone(value: string | undefined): string {
+  const timezone = value === undefined ? 'UTC' : requireString(value, 'timezone')
+  try {
+    assertTimezone(timezone)
+  } catch (error) {
+    if (error instanceof CronDialectError) {
+      throw new WakerError('invalid_timezone', error.message)
+    }
+    throw error
+  }
+  return timezone
+}
+
 export function toEpochMs(value: unknown): number {
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new WakerError('invalid_run_at', 'runAt 必须是有限数字（epoch 毫秒）')
@@ -66,8 +85,8 @@ export function normalizePayload(payload: JsonValue | undefined): JsonValue {
 
 export function resolvePolicies(input: Partial<JobPolicies> | undefined): JobPolicies {
   if (input === undefined) return { ...DEFAULT_JOB_POLICIES }
-  if (input === null || typeof input !== 'object') {
-    throw new WakerError('invalid_policy', 'policies 必须是对象')
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new WakerError('invalid_policy', 'policies 必须是对象，不能是数组等其它类型')
   }
 
   const misfire = input.misfire ?? DEFAULT_JOB_POLICIES.misfire

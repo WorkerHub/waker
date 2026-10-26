@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  CRON_ENGINE_CACHE_LIMIT,
   CronDialectError,
   assertTimezone,
   createCronSchedule,
+  cronEngineCacheSize,
   normalizeCronExpression,
   parseCronExpression,
 } from '../src/cron'
@@ -250,5 +252,29 @@ describe('规范化：CF 拼写 → 引擎 pattern', () => {
 
   it('原样保留 trim 后的表达式', () => {
     expect(parseCronExpression('  0 17 * * 1  ').expression).toBe('0 17 * * 1')
+  })
+})
+
+describe('引擎缓存：容量上限 + LRU 淘汰', () => {
+  it('缓存规模不超过上限，被淘汰的表达式重新创建后仍算得对', () => {
+    // 先记下第一条表达式的正确结果（作为「淘汰后重算」的对照）
+    const probe = '0 17 * * 1'
+    const from = Date.parse('2026-11-01T00:00:00.000Z')
+    const expected = createCronSchedule(probe, { timezone: UTC }).nextAfter(from)
+
+    // 造超过上限的、互不相同的 (表达式, 时区) 组合
+    for (let index = 0; index < CRON_ENGINE_CACHE_LIMIT + 50; index += 1) {
+      const minute = index % 60
+      const hour = index % 24
+      const dayOfMonth = (index % 28) + 1
+      createCronSchedule(`${minute} ${hour} ${dayOfMonth} * *`, { timezone: UTC })
+    }
+
+    expect(cronEngineCacheSize()).toBeLessThanOrEqual(CRON_ENGINE_CACHE_LIMIT)
+    // 确实在缓存（不是每次都不缓存）：规模已接近上限
+    expect(cronEngineCacheSize()).toBeGreaterThan(CRON_ENGINE_CACHE_LIMIT - 100)
+
+    // 被淘汰的旧表达式重新创建：结果与首次一致（重新解析不影响正确性）
+    expect(createCronSchedule(probe, { timezone: UTC }).nextAfter(from)).toBe(expected)
   })
 })
