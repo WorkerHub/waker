@@ -533,6 +533,129 @@ export interface SyncManifestResult {
   jobs: JobView[]
 }
 
+// ───────────────────── B6：只读查询 RPC（执行记录 / 死信） ─────────────────────
+//
+// 与 B3 / B4 相同的加法原则：B2 的方法表 / 出入参 / 错误码、B3 执行引擎 RPC、B4 管理面 RPC
+// 一律不动，这里只新增两个**只读**查询方法。
+//
+// 为什么需要它们：B2 的 `listJobs` 只覆盖任务；执行记录页与死信页（F2）要按任务 / 状态 /
+// 时间筛选翻页，而前端不写后端逻辑，所以查询能力必须落在 DO 里。
+//
+// 两条方法共同遵守的翻页语义（与 B2 `listJobs` 完全一致的 keyset 风格）：
+//   1. 排序键 + id 组成复合键，id 是稳定的 tiebreak（同一时刻多条不会在页间重复/丢失）；
+//   2. 游标是上一次返回的 `nextCursor` 原样回传的不透明字符串，由服务端解码；
+//   3. 排序键可空的列表（死信按重放状态分桶）按 B2 复评 blocking 的修法处理「NULL 区间」：
+//      分桶标志排在最前，游标落在 NULL 桶里时只在该桶内续页，绝不 OR 出另一桶，
+//      否则每页都会从头返回第 1 页、翻页死循环。
+
+/**
+ * 执行记录条目（执行记录页一行）。
+ *
+ * 刻意**不含 `payload`**：列表只回答「什么时候、哪个任务、成没成、多久、为什么失败」，
+ * 载荷是下游业务数据，不随列表批量下发（要排查时按 executionId 走单条查询）。
+ * 也不含 `signingKeyId` —— 签名审计是平台内部信息，不进前端契约。
+ */
+export interface ExecutionView {
+  id: string
+  jobId: string
+  /** 任务名（联表取，页面直接展示）；任务行只增不删，仍留 null 兜底。 */
+  jobName: string | null
+  projectId: string
+  trigger: ExecutionTrigger
+  /** 是否补跑（错过窗口后按 misfire 策略补的那一次）。 */
+  misfire: boolean
+  status: ExecutionStatus
+  /** `status = 'skipped'` 时的原因（并发策略主动跳过等）。 */
+  skipReason: string | null
+  /** 计划执行时刻（epoch ms，名义槽位，不含抖动）；也是本接口的排序键。 */
+  scheduledFor: number
+  /** 实际分发目标时刻（= scheduledFor + 抖动）。 */
+  dispatchAt: number
+  /** 已重试次数（0 = 首次投递；每次非终态失败 +1）。 */
+  attempt: number
+  startedAt: number | null
+  finishedAt: number | null
+  /** 耗时（毫秒）；未结束为 null。 */
+  durationMs: number | null
+  responseStatus: number | null
+  /** 失败原因（已截断到 1000 字符，绝不含密钥）。 */
+  error: string | null
+  createdAt: number
+  /** 自续生效时的 nextRunAt（epoch ms）；未自续或未生效为 null。 */
+  renewalAt: number | null
+  /** 自续被拒原因（`not_requested` 不落库，见 B3）。 */
+  renewalError: string | null
+}
+
+/** 死信的重放状态筛选：`pending` = 未重放，`replayed` = 已重放。 */
+export type DeadLetterReplayState = 'pending' | 'replayed'
+
+/**
+ * 执行记录查询（B6）。
+ *
+ * 时间区间一律是**半开区间** `[from, to)`：`from` 含、`to` 不含，
+ * 这样「按天分页」不会把 00:00:00.000 那一刻算两次。
+ */
+export interface ListExecutionsQuery {
+  /** 只看某个任务的执行记录。 */
+  jobId?: string
+  /** 只看某个项目的执行记录。 */
+  projectId?: string
+  status?: ExecutionStatus
+  trigger?: ExecutionTrigger
+  /** `scheduledFor` 下界（epoch ms，含）。 */
+  scheduledFrom?: number
+  /** `scheduledFor` 上界（epoch ms，不含）。 */
+  scheduledTo?: number
+  /** 默认 50，上限 200（与 `listJobs` 一致）。 */
+  limit?: number
+  /** 上一次返回的 `nextCursor`，不透明字符串。 */
+  cursor?: string | null
+}
+
+/**
+ * 执行记录查询结果。
+ *
+ * 排序（定死）：`scheduledFor DESC, id DESC` —— 最近的排最前。
+ * 为什么用 `scheduledFor` 而不是 `finishedAt`：`scheduled_for` 是不可变列（写入后不再改），
+ * 翻页期间不会因为执行完成而动位（`finished_at` 一写就让已翻过的行换位置，翻页会漏行）；
+ * 同时也避免用「页面上没展示的列」当排序键，前端看到的顺序与渲染顺序一致。
+ */
+export interface ListExecutionsResult {
+  executions: ExecutionView[]
+  nextCursor: string | null
+}
+
+/** 死信查询（B6）。条目结构复用 B3 的 {@link DeadLetterView}（含 payload，重放详情页要用）。 */
+export interface ListDeadLettersQuery {
+  jobId?: string
+  projectId?: string
+  /** 按重放状态筛选；不传 = 全部。 */
+  replayState?: DeadLetterReplayState
+  /** `createdAt` 下界（epoch ms，含）。 */
+  createdFrom?: number
+  /** `createdAt` 上界（epoch ms，不含）。 */
+  createdTo?: number
+  /** 默认 50，上限 200（与 `listJobs` 一致）。 */
+  limit?: number
+  /** 上一次返回的 `nextCursor`，不透明字符串。 */
+  cursor?: string | null
+}
+
+/**
+ * 死信查询结果。
+ *
+ * 排序（定死）：**未重放优先** → `createdAt DESC` → `id DESC`。
+ * 为什么「未重放优先」而不是纯时间序：死信页的核心动作是「把待重放的捞出来处理」，
+ * 打开页面第一屏就该是还没人管的那些；已重放的按死亡时刻倒序排在后面做留痕。
+ * 排序桶用的可空列是 `replayed_at`，所以本接口是「NULL 区间」翻页语义的落地处
+ * （见文件头第 3 条）。
+ */
+export interface ListDeadLettersResult {
+  deadLetters: DeadLetterView[]
+  nextCursor: string | null
+}
+
 // ───────────────────── B4：系统状态（watchdog / 存储 / 计数） ─────────────────────
 
 /**

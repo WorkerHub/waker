@@ -9,12 +9,20 @@ import {
   MAX_NAME_LENGTH,
   buildSchedule,
   decodeCursor,
+  decodeDeadLetterCursor,
+  decodeExecutionCursor,
   describeRef,
   encodeCursor,
+  encodeDeadLetterCursor,
+  encodeExecutionCursor,
   normalizeLimit,
   normalizePayload,
+  optionalString,
+  requireEnum,
   requireNonNegativeInt,
   requireString,
+  requireTimeBound,
+  requireTimeRange,
   resolveCallbackBaseUrl,
   resolvePolicies,
   resolveTimezone,
@@ -59,11 +67,13 @@ import type {
   CreateProjectInput,
   CreateProjectResult,
   DeadLetterInput,
+  DeadLetterReplayState,
   DeadLetterView,
   DispatchItem,
   ExecutionCallbackContext,
   ExecutionStatus,
   ExecutionTrigger,
+  ExecutionView,
   IssuedSigningKey,
   JobKind,
   JobPolicies,
@@ -71,6 +81,10 @@ import type {
   JobStatus,
   JobView,
   JsonValue,
+  ListDeadLettersQuery,
+  ListDeadLettersResult,
+  ListExecutionsQuery,
+  ListExecutionsResult,
   ListJobsQuery,
   ListJobsResult,
   ListProjectsResult,
@@ -125,6 +139,19 @@ const MAX_MANIFEST_JOBS = 200
 const WATCHDOG_LAST_RUN_AT = 'watchdog_last_run_at'
 const WATCHDOG_LAST_DUE_JOBS = 'watchdog_last_due_jobs'
 
+/** B6 查询 RPC 的筛选值域（与 schema 里的 CHECK 约束一致；写错就报 `invalid_argument`）。 */
+const EXECUTION_STATUSES: readonly ExecutionStatus[] = [
+  'pending',
+  'dispatched',
+  'running',
+  'succeeded',
+  'failed',
+  'dead',
+  'skipped',
+]
+const EXECUTION_TRIGGERS: readonly ExecutionTrigger[] = ['schedule', 'manual']
+const DEAD_LETTER_REPLAY_STATES: readonly DeadLetterReplayState[] = ['pending', 'replayed']
+
 /** jobs 表行（列名与 SQL 一一对应；索引签名是 SqlStorage 的行约束）。 */
 interface JobRow extends Record<string, string | number | null> {
   id: string
@@ -171,6 +198,25 @@ interface ExecutionRow extends Record<string, string | number | null> {
   signing_key_id: string | null
   renewal_at: number | null
   renewal_error: string | null
+}
+
+/** 执行记录行 + 联表取的任务名（B6 `listExecutions`）。 */
+interface ExecutionListRow extends ExecutionRow {
+  job_name: string | null
+}
+
+/** 死信行（B3 写入，B6 只读）。 */
+interface DeadLetterRow extends Record<string, string | number | null> {
+  id: string
+  execution_id: string
+  job_id: string
+  project_id: string
+  attempts: number
+  error: string
+  payload: string
+  created_at: number
+  replayed_at: number | null
+  replayed_execution_id: string | null
 }
 
 interface InsertExecutionParams {
@@ -555,6 +601,195 @@ export class WakerDO extends DurableObject<Env> {
         : null
 
     return { jobs: page.map((row) => this.#toView(row)), nextCursor }
+  }
+
+  // ───────────────────── B6：只读查询 RPC（执行记录 / 死信） ─────────────────────
+
+  /**
+   * 分页查询执行记录，按 `scheduled_for DESC, id DESC`（最近的排最前）。
+   *
+   * 只读：不碰 alarm、不改任何行。
+   */
+  async listExecutions(
+    query: ListExecutionsQuery = {},
+  ): Promise<WakerResult<ListExecutionsResult>> {
+    try {
+      return ok(this.#listExecutions(query))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  #listExecutions(query: ListExecutionsQuery): ListExecutionsResult {
+    const sql = this.ctx.storage.sql
+    const limit = normalizeLimit(query.limit)
+
+    const jobId = optionalString(query.jobId, 'jobId')
+    const projectId = optionalString(query.projectId, 'projectId')
+    const status =
+      query.status === undefined || query.status === null
+        ? undefined
+        : requireEnum(query.status, 'status', EXECUTION_STATUSES)
+    const trigger =
+      query.trigger === undefined || query.trigger === null
+        ? undefined
+        : requireEnum(query.trigger, 'trigger', EXECUTION_TRIGGERS)
+    const scheduledFrom = requireTimeBound(query.scheduledFrom, 'scheduledFrom')
+    const scheduledTo = requireTimeBound(query.scheduledTo, 'scheduledTo')
+    requireTimeRange(scheduledFrom, scheduledTo, 'scheduledFrom', 'scheduledTo')
+
+    const where: string[] = []
+    const bindings: (string | number | null)[] = []
+
+    if (jobId !== undefined) {
+      where.push('e.job_id = ?')
+      bindings.push(jobId)
+    }
+    if (projectId !== undefined) {
+      where.push('e.project_id = ?')
+      bindings.push(projectId)
+    }
+    if (status !== undefined) {
+      where.push('e.status = ?')
+      bindings.push(status)
+    }
+    if (trigger !== undefined) {
+      where.push('e.trigger = ?')
+      bindings.push(trigger)
+    }
+    if (scheduledFrom !== undefined) {
+      where.push('e.scheduled_for >= ?')
+      bindings.push(scheduledFrom)
+    }
+    if (scheduledTo !== undefined) {
+      where.push('e.scheduled_for < ?')
+      bindings.push(scheduledTo)
+    }
+
+    if (query.cursor !== undefined && query.cursor !== null) {
+      const cursor = decodeExecutionCursor(query.cursor)
+      // 降序 keyset：严格小于游标的 (scheduled_for, id) 才是下一页。
+      // `scheduled_for` 是 NOT NULL 列，这里不存在 B2 `listJobs` 那个 NULL 区间问题；
+      // id 是同一时刻多条时的稳定 tiebreak。
+      where.push('(e.scheduled_for < ? OR (e.scheduled_for = ? AND e.id < ?))')
+      bindings.push(cursor.scheduledFor, cursor.scheduledFor, cursor.id)
+    }
+
+    const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''
+    // 联表取任务名：执行记录页要直接展示「哪个任务」，否则前端得为每一行再查一次。
+    const rows = sql
+      .exec<ExecutionListRow>(
+        `SELECT e.*, j.name AS job_name
+           FROM executions e
+           LEFT JOIN jobs j ON j.id = e.job_id
+           ${whereSql}
+          ORDER BY e.scheduled_for DESC, e.id DESC
+          LIMIT ?`,
+        ...bindings,
+        limit + 1,
+      )
+      .toArray()
+
+    const page = rows.slice(0, limit)
+    const last = page.at(-1)
+    const nextCursor =
+      rows.length > limit && last
+        ? encodeExecutionCursor({ scheduledFor: last.scheduled_for, id: last.id })
+        : null
+
+    return { executions: page.map((row) => this.#toExecutionView(row)), nextCursor }
+  }
+
+  /**
+   * 分页查询死信，排序：未重放优先 → `created_at DESC` → `id DESC`。
+   *
+   * 只读：重放动作仍归 B3 的 `replayDeadLetter`。
+   */
+  async listDeadLetters(
+    query: ListDeadLettersQuery = {},
+  ): Promise<WakerResult<ListDeadLettersResult>> {
+    try {
+      return ok(this.#listDeadLetters(query))
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
+  #listDeadLetters(query: ListDeadLettersQuery): ListDeadLettersResult {
+    const sql = this.ctx.storage.sql
+    const limit = normalizeLimit(query.limit)
+
+    const jobId = optionalString(query.jobId, 'jobId')
+    const projectId = optionalString(query.projectId, 'projectId')
+    const replayState =
+      query.replayState === undefined || query.replayState === null
+        ? undefined
+        : requireEnum(query.replayState, 'replayState', DEAD_LETTER_REPLAY_STATES)
+    const createdFrom = requireTimeBound(query.createdFrom, 'createdFrom')
+    const createdTo = requireTimeBound(query.createdTo, 'createdTo')
+    requireTimeRange(createdFrom, createdTo, 'createdFrom', 'createdTo')
+
+    const where: string[] = []
+    const bindings: (string | number | null)[] = []
+
+    if (jobId !== undefined) {
+      where.push('job_id = ?')
+      bindings.push(jobId)
+    }
+    if (projectId !== undefined) {
+      where.push('project_id = ?')
+      bindings.push(projectId)
+    }
+    if (replayState !== undefined) {
+      where.push(replayState === 'pending' ? 'replayed_at IS NULL' : 'replayed_at IS NOT NULL')
+    }
+    if (createdFrom !== undefined) {
+      where.push('created_at >= ?')
+      bindings.push(createdFrom)
+    }
+    if (createdTo !== undefined) {
+      where.push('created_at < ?')
+      bindings.push(createdTo)
+    }
+
+    if (query.cursor !== undefined && query.cursor !== null) {
+      const cursor = decodeDeadLetterCursor(query.cursor)
+      // 两个桶都按 `created_at DESC, id DESC` 排序，桶只决定「谁先谁后」。
+      // 游标落在 NULL 桶（未重放）时：桶内继续按 (created_at, id) 降序，
+      // **并且**接上排在它后面的已重放桶（整桶都还没翻过）；
+      // 游标落在已重放桶时：只剩桶内剩余，绝不能再 OR 出 NULL 桶，
+      // 否则每页都从头返回第 1 页、翻页死循环（B2 复评 blocking 的那个坑）。
+      where.push(
+        cursor.replayState === 'pending'
+          ? '((replayed_at IS NULL AND (created_at < ? OR (created_at = ? AND id < ?)))\n              OR replayed_at IS NOT NULL)'
+          : 'replayed_at IS NOT NULL AND (created_at < ? OR (created_at = ? AND id < ?))',
+      )
+      bindings.push(cursor.createdAt, cursor.createdAt, cursor.id)
+    }
+
+    const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''
+    const rows = sql
+      .exec<DeadLetterRow>(
+        `SELECT * FROM dead_letters ${whereSql}
+          ORDER BY (replayed_at IS NULL) DESC, created_at DESC, id DESC
+          LIMIT ?`,
+        ...bindings,
+        limit + 1,
+      )
+      .toArray()
+
+    const page = rows.slice(0, limit)
+    const last = page.at(-1)
+    const nextCursor =
+      rows.length > limit && last
+        ? encodeDeadLetterCursor({
+            replayState: last.replayed_at === null ? 'pending' : 'replayed',
+            createdAt: last.created_at,
+            id: last.id,
+          })
+        : null
+
+    return { deadLetters: page.map((row) => this.#toDeadLetterView(row)), nextCursor }
   }
 
   /**
@@ -1357,18 +1592,7 @@ export class WakerDO extends DurableObject<Env> {
 
   #requireDeadLetterView(deadLetterId: string): DeadLetterView {
     const rows = this.ctx.storage.sql
-      .exec<{
-        id: string
-        execution_id: string
-        job_id: string
-        project_id: string
-        attempts: number
-        error: string
-        payload: string
-        created_at: number
-        replayed_at: number | null
-        replayed_execution_id: string | null
-      }>('SELECT * FROM dead_letters WHERE id = ? LIMIT 1', deadLetterId)
+      .exec<DeadLetterRow>('SELECT * FROM dead_letters WHERE id = ? LIMIT 1', deadLetterId)
       .toArray()
 
     const row = rows[0]
@@ -1376,6 +1600,11 @@ export class WakerDO extends DurableObject<Env> {
       throw new WakerError('dead_letter_not_found', `死信不存在：${deadLetterId}`)
     }
 
+    return this.#toDeadLetterView(row)
+  }
+
+  /** 死信行 → 契约视图（单条查询与 B6 列表共用，避免两份字段映射走叉）。 */
+  #toDeadLetterView(row: DeadLetterRow): DeadLetterView {
     return {
       id: row.id,
       executionId: row.execution_id,
@@ -1387,6 +1616,31 @@ export class WakerDO extends DurableObject<Env> {
       createdAt: row.created_at,
       replayedAt: row.replayed_at,
       replayedExecutionId: row.replayed_execution_id,
+    }
+  }
+
+  /** 执行记录行 → 执行记录视图（B6；不含 payload / signingKeyId，见 `ExecutionView`）。 */
+  #toExecutionView(row: ExecutionListRow): ExecutionView {
+    return {
+      id: row.id,
+      jobId: row.job_id,
+      jobName: row.job_name,
+      projectId: row.project_id,
+      trigger: row.trigger as ExecutionTrigger,
+      misfire: row.misfire === 1,
+      status: row.status as ExecutionStatus,
+      skipReason: row.skip_reason,
+      scheduledFor: row.scheduled_for,
+      dispatchAt: row.dispatch_at,
+      attempt: row.attempt,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      durationMs: row.duration_ms,
+      responseStatus: row.response_status,
+      error: row.error,
+      createdAt: row.created_at,
+      renewalAt: row.renewal_at,
+      renewalError: row.renewal_error,
     }
   }
 
