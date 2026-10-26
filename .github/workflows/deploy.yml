@@ -1,7 +1,8 @@
 name: Deploy
 
 # 部署归用户关口：只允许手动触发，且必须显式确认。
-# 凭据未配齐时 preflight 会明确报出缺哪把 key，deploy job 直接跳过（不生成、不绕过）。
+# 凭据未配齐时 preflight 明确报出缺哪把 key，并让本次 run 结论为 failure（红）；
+# deploy job 直接跳过（不生成 secrets.json、不绕过、不降级校验）。
 on:
   workflow_dispatch:
     inputs:
@@ -27,6 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 确认输入
+        if: inputs.confirm != 'deploy'
+        run: |
+          echo "::error::未确认部署：请在手动触发时把 confirm 填成 deploy。"
+          exit 1
+
       - name: 逐键校验（SETUP_SECRET / JWT_SECRET / CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID）
         id: check
         env:
@@ -35,17 +42,19 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          if bash scripts/ci/gen-secrets-file.sh --check; then
+          # 通过 → creds_ready=true；
+          # 不通过 → creds_ready=false + 本步骤退出码 1（job/run 结论为 failure，缺凭据绝不能显示绿色）。
+          # 脚本只输出键名与状态，绝不输出任何密钥值。
+          if out="$(bash scripts/ci/gen-secrets-file.sh --check 2>&1)"; then
+            echo "$out"
             echo "creds_ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "creds_ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::凭据关口未通过：请先在仓库 Settings → Secrets and variables 配齐上述 key，再重跑本工作流。"
+            exit 0
           fi
 
-      - name: 确认输入
-        if: inputs.confirm != 'deploy'
-        run: |
-          echo "::error::未确认部署：请在手动触发时把 confirm 填成 deploy。"
+          echo "creds_ready=false" >> "$GITHUB_OUTPUT"
+          echo "$out"
+          missing="$(printf '%s\n' "$out" | sed -n 's/.*缺少：\([^（]*\)（失败关闭.*/\1/p' | head -1)"
+          echo "::error::凭据关口未通过（失败关闭）：缺少 ${missing:-未知}。本次 run 标记为失败，不生成 secrets.json，deploy job 不执行。请先在仓库 Settings → Secrets and variables 配齐上述 key，再重跑本工作流。"
           exit 1
 
   deploy:
@@ -66,6 +75,18 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # wrangler.toml 的 [assets] directory = "./web/dist" 是外置目录，
+      # 必须先构建前端，否则 wrangler deploy 会因目录不存在直接失败。
+      - name: 构建前端（web/dist）
+        run: pnpm build:web
+
+      - name: 校验前端构建产物存在
+        run: |
+          if [ ! -f web/dist/index.html ]; then
+            echo "::error::web/dist/index.html 不存在，前端构建未产出，拒绝部署（wrangler.toml 的 assets.directory 无法满足）。"
+            exit 1
+          fi
 
       - name: 生成 $RUNNER_TEMP/secrets.json（0600，逐键非空，失败关闭）
         env:
