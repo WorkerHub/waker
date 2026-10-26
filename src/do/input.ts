@@ -8,6 +8,7 @@ import { WakerError } from './errors'
 import {
   DEFAULT_JOB_POLICIES,
   type ConcurrencyPolicy,
+  type DeadLetterReplayState,
   type JobPolicies,
   type JobRef,
   type JsonValue,
@@ -172,6 +173,134 @@ export function normalizeLimit(limit: number | undefined): number {
     throw new WakerError('invalid_argument', 'limit 必须是 ≥ 1 的整数')
   }
   return Math.min(limit, MAX_LIST_LIMIT)
+}
+
+/**
+ * 校验枚举型筛选值（B6 查询 RPC 用）。
+ *
+ * 为什么不像 `listJobs` 那样直接把字符串拼进 SQL 绑定：状态/触发方式写错时
+ * 返回「空列表」会把「参数错了」伪装成「没有数据」，查询页会白屏而没人发现；
+ * 这里直接 `invalid_argument`，调用方（HTTP 面 → 400）能立刻定位。
+ */
+export function requireEnum<T extends string>(
+  value: unknown,
+  field: string,
+  allowed: readonly T[],
+): T {
+  const raw = requireString(value, field)
+  if (!(allowed as readonly string[]).includes(raw)) {
+    throw new WakerError('invalid_argument', `${field} 必须是 ${allowed.join(' / ')}`)
+  }
+  return raw as T
+}
+
+/** 时间区间端点（epoch ms，整数、非负）；`undefined` = 该侧不设限。 */
+export function requireTimeBound(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new WakerError('invalid_argument', `${field} 必须是整数 epoch 毫秒`)
+  }
+  if (value < 0) throw new WakerError('invalid_argument', `${field} 不能为负数`)
+  return value
+}
+
+/** 半开区间 `[from, to)`：两端都给时必须 `from <= to`（相等 = 空区间，是合法查询）。 */
+export function requireTimeRange(
+  from: number | undefined,
+  to: number | undefined,
+  fromField: string,
+  toField: string,
+): void {
+  if (from !== undefined && to !== undefined && from > to) {
+    throw new WakerError('invalid_argument', `${fromField} 不能大于 ${toField}`)
+  }
+}
+
+/** 可选筛选值（字符串类、非枚举）：`undefined` / `null` 视为不过滤。 */
+export function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined
+  return requireString(value, field)
+}
+
+/**
+ * 游标前缀：不同列表的游标不能互用（混用会得到「看起来能翻、实际乱序」的结果）。
+ * 前缀让误用当场报 `invalid_argument`，而不是静默返回错页。
+ */
+const EXECUTION_CURSOR_PREFIX = 'e1'
+const DEAD_LETTER_CURSOR_PREFIX = 'd1'
+
+function joinCursor(parts: (string | number)[]): string {
+  return parts.join('|')
+}
+
+function splitCursor(raw: unknown, prefix: string, expectedParts: number, label: string): string[] {
+  if (typeof raw !== 'string') {
+    throw new WakerError('invalid_argument', `${label} cursor 不是本接口返回的值`)
+  }
+  const parts = raw.split('|')
+  if (parts.length !== expectedParts || parts[0] !== prefix) {
+    throw new WakerError('invalid_argument', `${label} cursor 不是本接口返回的值`)
+  }
+  for (let index = 1; index < parts.length; index += 1) {
+    if (parts[index] === '') {
+      throw new WakerError('invalid_argument', `${label} cursor 不是本接口返回的值`)
+    }
+  }
+  return parts
+}
+
+function parseCursorNumber(raw: string, label: string): number {
+  const value = Number(raw)
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new WakerError('invalid_argument', `${label} cursor 不是本接口返回的值`)
+  }
+  return value
+}
+
+/** 执行记录游标：`e1|<scheduledFor>|<id>`（按 `scheduledFor DESC, id DESC` 续页）。 */
+export function encodeExecutionCursor(cursor: { scheduledFor: number; id: string }): string {
+  return joinCursor([EXECUTION_CURSOR_PREFIX, cursor.scheduledFor, cursor.id])
+}
+
+export function decodeExecutionCursor(raw: unknown): { scheduledFor: number; id: string } {
+  const [, head, id] = splitCursor(raw, EXECUTION_CURSOR_PREFIX, 3, '执行记录')
+  return { scheduledFor: parseCursorNumber(head!, '执行记录'), id: id! }
+}
+
+/**
+ * 死信游标：`d1|<p|r>|<createdAt>|<id>`。
+ *
+ * `p` = 未重放的桶（`replayed_at IS NULL`），`r` = 已重放的桶。桶必须进游标：
+ * 没有它就分不清「当前在 NULL 区间里」还是「NULL 区间之后」，而这正是
+ * B2 复评 blocking 那个翻页死循环的成因。
+ */
+export function encodeDeadLetterCursor(cursor: {
+  replayState: DeadLetterReplayState
+  createdAt: number
+  id: string
+}): string {
+  return joinCursor([
+    DEAD_LETTER_CURSOR_PREFIX,
+    cursor.replayState === 'pending' ? 'p' : 'r',
+    cursor.createdAt,
+    cursor.id,
+  ])
+}
+
+export function decodeDeadLetterCursor(raw: unknown): {
+  replayState: DeadLetterReplayState
+  createdAt: number
+  id: string
+} {
+  const [, bucket, head, id] = splitCursor(raw, DEAD_LETTER_CURSOR_PREFIX, 4, '死信')
+  if (bucket !== 'p' && bucket !== 'r') {
+    throw new WakerError('invalid_argument', '死信 cursor 不是本接口返回的值')
+  }
+  return {
+    replayState: bucket === 'p' ? 'pending' : 'replayed',
+    createdAt: parseCursorNumber(head!, '死信'),
+    id: id!,
+  }
 }
 
 /** 游标：`next_run_at`(或 `n` 表示 NULL) + `|` + id；对调用方不透明。 */
