@@ -1,10 +1,56 @@
-name = "workers-scheduler-dispatcher"
-main = "src/dispatcher/index.ts"
-compatibility_date = "2024-01-01"
+# waker —— 全舰队统一调度平台
+# 规格：父单 ONE-373 内嵌 SPEC.md v1.0（唯一规格源）。
+#
+# ⚠ 绑定契约（本单 B1 定死，后续子单原样沿用，改名需评审）：
+#   Durable Object : WAKER_DO       → 类 WakerDO（任务真源，SQLite）
+#   Queue 主队列    : WAKER_QUEUE    → 队列 waker-jobs
+#   Queue 死信队列  : WAKER_DLQ      → 队列 waker-dlq
+#   Cron            : watchdog，每小时，全仓唯一
+#
+# 存储硬约束：真源只有 WakerDO 的 SQLite。不建 D1、不建 KV、无 TABLE_PREFIX。
 
+name = "waker"
+main = "src/index.ts"
+compatibility_date = "2026-10-26"
+workers_dev = true
+
+# 自定义域名（部署关口由用户执行；wrangler dev 不受影响）
+routes = [{ pattern = "waker.oneboy.app", custom_domain = true }]
+
+# ── Cron Trigger：全仓唯一 1 个（watchdog），其余 4 个槽留空给别的项目 ──
+# watchdog 只做一件事：每小时 ping WakerDO 校正 alarm（防 alarm 丢失 / 部署漂移）。
+# 业务任务一律走 DO alarm，不允许新增 Cron Trigger。
 [triggers]
-crons = ["* * * * *"]
+crons = ["0 * * * *"]
 
-[[kv_namespaces]]
-binding = "CRON_REGISTRY"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+# ── Durable Object：任务真源（SQLite 后端）───────────────────────────
+[[durable_objects.bindings]]
+name = "WAKER_DO"
+class_name = "WakerDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WakerDO"]
+
+# ── Queues：主分发队列（alarm → consumer → 下游回调）──────────────
+[[queues.producers]]
+binding = "WAKER_QUEUE"
+queue = "waker-jobs"
+
+[[queues.consumers]]
+queue = "waker-jobs"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "waker-dlq"
+
+# ── Queues：死信队列（消息转存 DO 死信表供页面重放）──────────────
+[[queues.producers]]
+binding = "WAKER_DLQ"
+queue = "waker-dlq"
+
+[[queues.consumers]]
+queue = "waker-dlq"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: typecheck / lint / test / build
+    runs-on: ubuntu-latest
+    env:
+      # 非部署 job 用占位值：只用于验证代码能在「密钥存在」的前提下构建/测试，
+      # 占位值不是真实密钥，也不参与任何部署。
+      SETUP_SECRET: ci-placeholder-not-a-real-secret
+      JWT_SECRET: ci-placeholder-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Guard — 全仓只有 1 个 Cron Trigger（watchdog），无 D1 / KV
+        run: pnpm check:cron
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build (wrangler dry-run bundle)
+        run: pnpm build
+
+      - name: Secrets 管线自检（逐键校验 fail closed + 0600）
+        run: |
+          # 缺键时必须失败关闭
+          if env -u SETUP_SECRET -u JWT_SECRET bash scripts/ci/gen-secrets-file.sh --check; then
+            echo "::error::缺键时脚本竟然成功了，fail closed 被破坏"
+            exit 1
+          fi
+          # 齐全时必须通过，且生成 0600 文件
+          bash scripts/ci/gen-secrets-file.sh
+          test "$(stat -c '%a' "$RUNNER_TEMP/secrets.json")" = "600"
+          rm -f "$RUNNER_TEMP/secrets.json"
