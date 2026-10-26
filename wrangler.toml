@@ -56,3 +56,13 @@ queue = "waker-dlq"
 max_batch_size = 10
 max_batch_timeout = 1
 max_retries = 3
+
+# ── 静态资源：管理面 SPA（F1 起）──────────────────────────────────
+# 构建产物来自 web/（Vite + React + shadcn/ui），`pnpm build:web` 生成到 web/dist。
+# /api/* 与 /v1/* 必须先进 Worker（鉴权与契约映射都在 Worker 里），其余路径交给
+# 静态资源；SPA 深链（如 /projects）回落 index.html。
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/v1/*", "/healthz"]
