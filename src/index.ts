@@ -1,10 +1,10 @@
 import { app } from './app'
 import { handleScheduled } from './cron/watchdog'
-import { SchedulerDO } from './do/scheduler-do'
+import { WakerDO } from './do/waker-do'
 import type { DeadLetterMessage, Env, JobMessage } from './env'
 import { handleQueue } from './queue/consumer'
 
-export { SchedulerDO }
+export { WakerDO }
 
 /**
  * Worker 入口骨架：fetch / scheduled / queue 三入口齐全，业务实现在后续子单。

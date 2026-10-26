@@ -1,42 +1,44 @@
-# workers-scheduler
+# waker
 
 全舰队统一调度平台。用 **1 个 watchdog Cron Trigger + Durable Object Alarm + Queue** 取代各项目自有的 Cron Triggers，支持声明式 cron 任务与 one-shot 自续任务。
 
-规格：父单 ONE-373 内嵌 SPEC.md v1.0（唯一规格源）。本仓库按该规格原地重写，无旧版兼容层。
+- Worker：`waker`
+- 域名：`waker.oneboy.app`
+- 规格：父单 ONE-373 内嵌 SPEC.md v1.0（唯一规格源）
 
 > 当前状态：**脚手架阶段（B1）**。仓库骨架、wrangler 配置、CI/CD、密钥管线已就位；调度内核、API、管理面均为后续子单，代码里只有占位空壳。
 
 ## 架构（骨架已定型）
 
 ```
-下游 Worker ──注册/创建任务(API)──► Scheduler Worker
+下游 Worker ──注册/创建任务(API)──► waker Worker
                                         │ RPC
                                 ┌───────┴────────┐
-                                │ SchedulerDO    │ 唯一实例，真源 SQLite
+                                │ WakerDO        │ 唯一实例，真源 SQLite
                                 │ setAlarm(最近到期)│
                                 └───────┬────────┘
                             alarm 到期   │ 投递
                                         ▼
-                                   JOB_QUEUE ──► consumer ──► 下游回调（HMAC 签名）
+                                  WAKER_QUEUE ──► consumer ──► 下游回调（HMAC 签名）
                                         │ 重试用尽
                                         ▼
-                                   JOB_DLQ ──► consumer ──► DO 死信表（页面可重放）
-watchdog Cron（全仓唯一，每小时）──► ping SchedulerDO 校正 alarm
+                                  WAKER_DLQ ──► consumer ──► DO 死信表（页面可重放）
+watchdog Cron（全仓唯一，每小时）──► ping WakerDO 校正 alarm
 ```
 
 绑定契约（B1 定死，后续子单沿用，改名需评审）：
 
 | 类型 | 绑定名 | 目标 |
 |---|---|---|
-| Durable Object | `SCHEDULER_DO` | 类 `SchedulerDO`（SQLite 后端，任务真源） |
-| Queue（主） | `JOB_QUEUE` | `workers-scheduler-jobs` |
-| Queue（死信） | `JOB_DLQ` | `workers-scheduler-dlq` |
+| Durable Object | `WAKER_DO` | 类 `WakerDO`（SQLite 后端，任务真源） |
+| Queue（主） | `WAKER_QUEUE` | `waker-jobs` |
+| Queue（死信） | `WAKER_DLQ` | `waker-dlq` |
 | Cron | — | `0 * * * *`（watchdog，全仓唯一 1 个） |
 
 硬约束：
 
 1. 全仓只允许 1 个 Cron Trigger（watchdog）。`pnpm check:cron` 在 CI 里强制校验。
-2. 真源只有 `SchedulerDO` 的 SQLite：不建 D1、不用共享 D1、不用 KV。同上校验。
+2. 真源只有 `WakerDO` 的 SQLite：不建 D1、不用共享 D1、不用 KV。同上校验。
 3. 每个项目自己的 signing key 由平台运行时生成并存 DO，不进 env、不进 CI。
 
 ## 目录结构
@@ -44,7 +46,7 @@ watchdog Cron（全仓唯一，每小时）──► ping SchedulerDO 校正 ala
 ```
 src/index.ts            Worker 入口（fetch / scheduled / queue）
 src/app.ts              Hono 路由骨架（/healthz + 后续 API 占位 501）
-src/do/scheduler-do.ts  SchedulerDO 类壳（表结构与 alarm 逻辑见后续单）
+src/do/waker-do.ts      WakerDO 类壳（表结构与 alarm 逻辑见后续单）
 src/queue/consumer.ts   Queue consumer 骨架（主队列 / 死信队列）
 src/cron/watchdog.ts    watchdog 入口占位（后续单做 alarm 校正）
 src/env.ts              绑定与密钥的类型声明
@@ -90,4 +92,4 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 | 阶段 | 内容 |
 |---|---|
 | B1（本单） | 脚手架、wrangler、CI/CD、密钥管线 |
-| 后续 | SchedulerDO 内核与 alarm、Queue 分发与回调协议、注册 API、管理面、前端、SDK |
+| 后续 | WakerDO 内核与 alarm、Queue 分发与回调协议、注册 API、管理面、前端、SDK |

@@ -2,7 +2,7 @@
  * Worker 运行时绑定类型。
  *
  * 绑定名与 wrangler.toml 一一对应（B1 定死，后续子单沿用）：
- *   SCHEDULER_DO / JOB_QUEUE / JOB_DLQ
+ *   WAKER_DO / WAKER_QUEUE / WAKER_DLQ
  *
  * 密钥不落库、不落代码、不落日志：
  *   SETUP_SECRET / JWT_SECRET 由 GitHub Secrets → $RUNNER_TEMP/secrets.json →
@@ -27,11 +27,11 @@ export interface DeadLetterMessage {
 
 export interface Env {
   /** Durable Object 命名空间：任务真源（SQLite）。 */
-  SCHEDULER_DO: DurableObjectNamespace
+  WAKER_DO: DurableObjectNamespace
   /** 主分发队列（生产端）。 */
-  JOB_QUEUE: Queue<JobMessage>
+  WAKER_QUEUE: Queue<JobMessage>
   /** 死信队列（生产端，用于手动重放 / 显式转死信）。 */
-  JOB_DLQ: Queue<DeadLetterMessage>
+  WAKER_DLQ: Queue<DeadLetterMessage>
 
   /** 首次安装口令（一次性 setup 用），仅经 secrets 注入。 */
   SETUP_SECRET: string

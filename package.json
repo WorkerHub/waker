@@ -1,5 +1,5 @@
 {
-  "name": "workers-scheduler",
+  "name": "waker",
   "version": "2.0.0",
   "private": true,
   "description": "WorkerHub 全舰队统一调度平台：1 个 watchdog Cron + Durable Object Alarm + Queue",

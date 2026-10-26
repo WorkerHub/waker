@@ -58,7 +58,7 @@ if (cronHits.length !== 1) {
 
 if (storageHits.length > 0) {
   problems.push(
-    '禁止 D1 / KV 绑定（真源只有 SchedulerDO 的 SQLite）：\n' +
+    '禁止 D1 / KV 绑定（真源只有 WakerDO 的 SQLite）：\n' +
       storageHits.map((hit) => `  ${hit.file}:${hit.line}: ${hit.text}`).join('\n'),
   )
 }

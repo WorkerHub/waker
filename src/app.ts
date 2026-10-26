@@ -10,7 +10,7 @@ import type { Env } from './env'
  */
 export const app = new Hono<{ Bindings: Env }>()
 
-app.get('/healthz', (c) => c.json({ ok: true, service: 'workers-scheduler' }))
+app.get('/healthz', (c) => c.json({ ok: true, service: 'waker' }))
 
 /** 管理面 API（任务 / 执行日志 / 死信 / 项目 / 设置 / 系统管理）：后续单实现。 */
 app.all('/api/*', (c) => c.json({ error: 'not_implemented', scope: 'management-api' }, 501))
