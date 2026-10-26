@@ -79,11 +79,12 @@ client/src/client.ts    注册客户端：whoami / 清单对账 / one-shot 创�
 client/src/modes.ts     双模式判定（WAKER_MODE，缺省 cron）
 examples/reference-worker/  参考接入示例：同一份任务逻辑 + 两套 wrangler 配置（原生 / waker）
 web/                    管理面前端（Vite + React + shadcn/ui，构建产物由 Worker 静态资源托管）
-web/src/App.tsx         路由表（/login、/jobs、/projects）+ 会话守卫
-web/src/pages/          任务管理页 / 项目管理页 / 登录页
-web/src/components/     外壳、一次性凭据对话框、任务与项目组件
+web/src/App.tsx         路由表（/login、/jobs、/executions、/dead-letters、/projects）+ 会话守卫
+web/src/pages/          任务管理 / 执行记录 / 死信队列 / 项目管理 / 登录页
+web/src/components/     外壳、一次性凭据对话框、列表分页器、详情分区、任务 / 执行 / 死信 / 项目组件
 web/src/components/ui/  shadcn/ui 组件（Nova 风格，registry 原样落库）
-web/src/lib/api.ts      管理面 API client（B4 契约的出入参类型 + 错误码）
+web/src/lib/api.ts      管理面 API client（B2/B3/B4/B6 契约的出入参类型 + 错误码）
+web/src/lib/executions.ts 执行记录 / 死信的展示层映射（状态标签、耗时、重放入口可见性）
 web/src/stores/         会话 store（zustand）
 scripts/web/sync-shadcn.py  shadcn registry 同步脚本（组件源码唯一来源）scripts/check-single-cron.mjs  硬约束守卫（Cron 数量 / 禁 D1·KV）
 scripts/ci/gen-secrets-file.sh 密钥管线（逐键非空 → secrets.json 0600）
@@ -375,6 +376,58 @@ pnpm --filter @waker/web lint
 组件要新增或升级时重跑 `python3 scripts/web/sync-shadcn.py`（脚本会按 registry 的
 `registryDependencies` 递归拉取并统一改写 import 别名与图标占位符）。
 
+## 管理面前端（F2：执行记录 + 死信队列）
+
+| 页面 | 路由 | 对着的契约（RPC 已冻结） | 依赖的 HTTP 面（**尚未挂载**） |
+|---|---|---|---|
+| 执行记录 | `/executions` | B6 `listExecutions` | `GET /api/executions` |
+| 死信队列 | `/dead-letters` | B6 `listDeadLetters` + B3 `replayDeadLetter` | `GET /api/dead-letters`、`POST /api/dead-letters/{id}/replay` |
+
+契约原则（与 B6/B3 一致，前端不自造字段）：
+
+- 筛选与翻页原样映射 RPC 入参：执行记录 = `jobId` / `projectId` / `status` / `trigger` /
+  `scheduledFrom` / `scheduledTo` / `limit` / `cursor`；死信 = `jobId` / `projectId` /
+  `replayState` / `createdFrom` / `createdTo` / `limit` / `cursor`。前端不做本地二次过滤。
+- `nextCursor` 是唯一翻页依据（分页器只维护游标栈，不编页码）；排序（执行记录
+  `scheduledFor DESC, id DESC`、死信「未重放优先 → `createdAt DESC` → `id DESC`」）全在 WakerDO。
+- 时间区间一律半开 `[from, to)`；`from > to` 由页面就地拦下（不发必然 400 的请求），
+  `from === to` 的空区间仍交给后端判定。
+- 枚举筛选（`status` / `trigger` / `replayState`）的取值与契约白名单逐字一致；写错由后端报
+  `invalid_argument`，前端不静默兜成空列表。
+- 列表面板只读 `ExecutionView`（**不含 `payload` / `signingKeyId`**，载荷不随列表批量下发），
+  执行详情的「请求摘要」因此只展示调度事实（计划时刻 / 分发时刻 / 重试次数 / 跳过原因），
+  不展示、也不自造载荷明文。死信详情展示 `DeadLetterView.payload`（契约里唯一带载荷的视图）。
+- 重放走 B3 `replayDeadLetter`：二次确认后调用，结果回显新的 `executionId`；已重放过的死信
+  （`replayedAt !== null`）不提供重放入口，任务已取消时由后端回 `job_cancelled`。
+
+### 尚缺的 HTTP 面（薄映射，等后端挂载）
+
+这三条路由不在 B4 冻结的管理面 API 里（B4 只做到 501 占位），B6 也明确「HTTP 路由由后续单挂载」。
+形状与既有 `GET /api/jobs` 完全同构，只做「HTTP ↔ RPC」的薄映射：
+
+| 方法 | 路径 | 查询 / 请求 | 应答 | 错误 |
+|---|---|---|---|---|
+| GET | `/api/executions` | `jobId` / `projectId` / `status` / `trigger` / `scheduledFrom` / `scheduledTo` / `limit` / `cursor`（后三个为 epoch 毫秒与整数） | `{ executions: ExecutionView[], nextCursor: string \| null }` | `invalid_argument` 400 |
+| GET | `/api/dead-letters` | `jobId` / `projectId` / `replayState` / `createdFrom` / `createdTo` / `limit` / `cursor` | `{ deadLetters: DeadLetterView[], nextCursor: string \| null }` | `invalid_argument` 400 |
+| POST | `/api/dead-letters/{id}/replay` | 空 body | 202 `ReplayDeadLetterResult`（`deadLetterId` / `jobId` / `executionId` / `scheduledFor` / `dispatchAt`） | `dead_letter_not_found` 404、`job_cancelled` 409 |
+
+实现方式与 `managementRoutes` 现有条目一致：query 走 `queryValue` / `queryInt`，结果走 `respond`，
+并在 `src/do/http-rpc.ts` 的 `WakerApiRpc` 里补上 `listExecutions` / `listDeadLetters` /
+`replayDeadLetter` 三个方法（该 interface 的注释已写明它就是「HTTP 面用到的方法清单」）。
+未挂载期间两个页面会提示「管理面还没有挂载…路由」而不是伪装成空列表。
+
+### 已知契约缺口（已在子单评论上报，未自行改契约）
+
+- `DeadLetterView` 只有 `jobId`，没有 `jobName`（`ExecutionView` 有）。死信页的「来源任务」
+  目前用 `GET /api/jobs?limit=200` 建 `jobId → name` 映射兜底；任务量超过一页时会退化成显示 jobId。
+- `ExecutionView` 不含 `payload`，所以执行详情无法给出「请求载荷」摘要（宁可不展示也不自造）。
+
+前端自测（真 Provider + 真 API client，替身只放在最外层 `fetch` 边界）：
+
+```bash
+pnpm --filter @waker/web test   # 执行记录加载/筛选/翻页/详情、死信加载/筛选/重放/详情/501 提示
+```
+
 ## 本地开发
 
 ```bash
@@ -444,4 +497,5 @@ GitHub Secrets ─► scripts/ci/gen-secrets-file.sh ─► $RUNNER_TEMP/secrets
 | B4 | 注册 API + 清单对账、项目管理与凭据（令牌哈希 / signing key 加密）、管理面 API、watchdog 账本 |
 | B5 | 客户端 SDK（`client/`）+ 参考接入示例（`examples/reference-worker/`，双模式可选接入） |
 | F1 | 管理面：任务管理页 + 项目管理页（一次性凭据展示） |
-| F2-F3 | 执行记录页 / 死信页、设置与系统管理页 |
+| F2 | 管理面：执行记录页 + 死信队列页（B6 查询 RPC + B3 重放） |
+| F3 | 设置与系统管理页 |

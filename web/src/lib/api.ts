@@ -148,11 +148,123 @@ export interface ListJobsQuery {
   cursor?: string | null
 }
 
+// ───────────────────── 执行记录 / 死信（B6 + B3 冻结契约） ─────────────────────
+//
+// 字段与 `src/do/types.ts` 的 `ExecutionView` / `DeadLetterView` 一一对应，前端不增删：
+//   - `ExecutionView` **不含** `payload` / `signingKeyId` —— 载荷不随列表批量下发；
+//   - 死信条目复用 B3 的 `DeadLetterView`（含 `payload`，重放详情要展示）。
+
+export type ExecutionStatus =
+  | 'pending'
+  | 'dispatched'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'dead'
+  | 'skipped'
+
+export type ExecutionTrigger = 'schedule' | 'manual'
+
+export type DeadLetterReplayState = 'pending' | 'replayed'
+
+export interface ExecutionView {
+  id: string
+  jobId: string
+  /** 任务名（WakerDO 联表取）；任务行只增不删，仍留 null 兜底。 */
+  jobName: string | null
+  projectId: string
+  trigger: ExecutionTrigger
+  /** 是否补跑（错过窗口后按 misfire 策略补的那一次）。 */
+  misfire: boolean
+  status: ExecutionStatus
+  /** `status = 'skipped'` 时的原因（并发策略主动跳过等）。 */
+  skipReason: string | null
+  /** 计划执行时刻（epoch ms，排序键）。 */
+  scheduledFor: number
+  /** 实际分发目标时刻（= scheduledFor + 抖动）。 */
+  dispatchAt: number
+  /** 已重试次数（0 = 首次投递）。 */
+  attempt: number
+  startedAt: number | null
+  finishedAt: number | null
+  durationMs: number | null
+  responseStatus: number | null
+  error: string | null
+  createdAt: number
+  renewalAt: number | null
+  renewalError: string | null
+}
+
+export interface DeadLetterView {
+  id: string
+  executionId: string
+  jobId: string
+  projectId: string
+  attempts: number
+  error: string
+  payload: JsonValue
+  createdAt: number
+  replayedAt: number | null
+  replayedExecutionId: string | null
+}
+
+export interface ListExecutionsQuery {
+  jobId?: string
+  projectId?: string
+  status?: ExecutionStatus
+  trigger?: ExecutionTrigger
+  /** `scheduledFor` 下界（epoch ms，含）。 */
+  scheduledFrom?: number
+  /** `scheduledFor` 上界（epoch ms，不含）。 */
+  scheduledTo?: number
+  /** 默认 50，上限 200（与 `listJobs` 一致）。 */
+  limit?: number
+  cursor?: string | null
+}
+
+export interface ListExecutionsResult {
+  executions: ExecutionView[]
+  nextCursor: string | null
+}
+
+export interface ListDeadLettersQuery {
+  jobId?: string
+  projectId?: string
+  replayState?: DeadLetterReplayState
+  /** `createdAt` 下界（epoch ms，含）。 */
+  createdFrom?: number
+  /** `createdAt` 上界（epoch ms，不含）。 */
+  createdTo?: number
+  limit?: number
+  cursor?: string | null
+}
+
+export interface ListDeadLettersResult {
+  deadLetters: DeadLetterView[]
+  nextCursor: string | null
+}
+
+/** 重放结果：以同一任务新建一条 `manual` 执行，页面用它跟踪「哪一次执行」。 */
+export interface ReplayDeadLetterResult {
+  deadLetterId: string
+  jobId: string
+  executionId: string
+  scheduledFor: number
+  dispatchAt: number
+}
+
+/** 查询接口的 `limit` 上限（B6 契约：与 `listJobs` 一致，默认 50 / 上限 200）。 */
+export const PAGE_LIMIT_MAX = 200
+
 /** 管理面错误码（B2/B3/B4 冻结契约的超集里，只会命中前端可能触发的那些）。 */
 export type ApiErrorCode =
   | 'unauthorized'
   | 'invalid_json'
   | 'invalid_argument'
+  | 'execution_not_found'
+  | 'dead_letter_not_found'
+  /** 管理面兜底：该子路径还没挂载（HTTP 501，`{ error: 'not_implemented', scope }`）。 */
+  | 'not_implemented'
   | 'invalid_cron'
   | 'invalid_timezone'
   | 'invalid_run_at'
@@ -170,7 +282,7 @@ export type ApiErrorCode =
   | 'internal'
 
 export interface ApiErrorBody {
-  error?: { code?: string; message?: string; details?: unknown }
+  error?: { code?: string; message?: string; details?: unknown } | string
 }
 
 /** 契约错误：`code` 原样透出，页面按它决定提示语与是否跳登录。 */
@@ -218,14 +330,25 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     const payload = (body ?? {}) as ApiErrorBody
-    const code = payload.error?.code ?? 'internal'
-    const message = payload.error?.message ?? `请求失败（HTTP ${response.status}）`
+    // 未挂载的管理面子路径回 501 `{ error: 'not_implemented', scope }`（`error` 是字符串，
+    // 不是契约里的 `{ code, message }` 对象），这里一并收成稳定的 code，页面按它给提示。
+    const raw = payload.error
+    const code = typeof raw === 'string' ? raw : (raw?.code ?? 'internal')
+    const message =
+      typeof raw === 'string'
+        ? `该接口尚未挂载（HTTP ${response.status}）`
+        : (raw?.message ?? `请求失败（HTTP ${response.status}）`)
 
     if (response.status === 401 && path !== '/api/auth/setup') {
       authToken = null
       onUnauthorized()
     }
-    throw new ApiError(response.status, code, message, payload.error?.details)
+    throw new ApiError(
+      response.status,
+      code,
+      message,
+      typeof raw === 'string' ? undefined : raw?.details,
+    )
   }
 
   return body as T
@@ -233,6 +356,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 function jsonBody(value: unknown): string {
   return JSON.stringify(value ?? {})
+}
+
+/** 查询参数的「有值才拼」序列化：空字符串 / undefined / null 一律不发，避免伪造筛选。 */
+function queryString(entries: Array<[string, string | number | null | undefined]>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of entries) {
+    if (value === undefined || value === null || value === '') continue
+    params.set(key, String(value))
+  }
+  return params.size === 0 ? '' : `?${params.toString()}`
 }
 
 // ───────────────────────── 会话 ─────────────────────────
@@ -253,13 +386,13 @@ export async function createSession(setupSecret: string): Promise<SessionInfo> {
 // ───────────────────────── 任务 ─────────────────────────
 
 export function listJobs(query: ListJobsQuery = {}): Promise<ListJobsResult> {
-  const params = new URLSearchParams()
-  if (query.projectId) params.set('projectId', query.projectId)
-  if (query.status) params.set('status', query.status)
-  if (query.kind) params.set('kind', query.kind)
-  if (query.limit !== undefined) params.set('limit', String(query.limit))
-  if (query.cursor) params.set('cursor', query.cursor)
-  const suffix = params.size === 0 ? '' : `?${params.toString()}`
+  const suffix = queryString([
+    ['projectId', query.projectId],
+    ['status', query.status],
+    ['kind', query.kind],
+    ['limit', query.limit],
+    ['cursor', query.cursor],
+  ])
   return request<ListJobsResult>(`/api/jobs${suffix}`)
 }
 
@@ -334,4 +467,91 @@ export function rotateSigningKey(projectId: string): Promise<RotateSigningKeyRes
     `/api/projects/${encodeURIComponent(projectId)}/signing-key/rotate`,
     { method: 'POST' },
   )
+}
+
+// ───────────────────── 执行记录 / 死信 ─────────────────────
+//
+// HTTP 面（管理面薄映射，与 `GET /api/jobs` 同一套路；三个路径在 B4 的 501 占位里
+// 已经点名过，RPC 由 B6 / B3 冻结）：
+//
+//   GET  /api/executions?jobId&projectId&status&trigger&scheduledFrom&scheduledTo&limit&cursor
+//        → `{ executions, nextCursor }`（= B6 `listExecutions`）
+//   GET  /api/dead-letters?jobId&projectId&replayState&createdFrom&createdTo&limit&cursor
+//        → `{ deadLetters, nextCursor }`（= B6 `listDeadLetters`）
+//   POST /api/dead-letters/{id}/replay
+//        → `ReplayDeadLetterResult`（= B3 `replayDeadLetter`）
+//
+// 契约里 `nextCursor` 是唯一翻页依据；时间区间一律半开 `[from, to)`（epoch ms）。
+
+export interface ListExecutionsQueryParams {
+  jobId?: string
+  projectId?: string
+  status?: ExecutionStatus
+  trigger?: ExecutionTrigger
+  scheduledFrom?: number
+  scheduledTo?: number
+  limit?: number
+  cursor?: string | null
+}
+
+export interface ListDeadLettersQueryParams {
+  jobId?: string
+  projectId?: string
+  replayState?: DeadLetterReplayState
+  createdFrom?: number
+  createdTo?: number
+  limit?: number
+  cursor?: string | null
+}
+
+/**
+ * 执行记录列表（= B6 `listExecutions`）。排序与翻页语义全在 WakerDO：
+ * `scheduledFor DESC, id DESC` + keyset 游标，前端只原样回传 `nextCursor`。
+ */
+export function listExecutions(
+  query: ListExecutionsQueryParams = {},
+): Promise<ListExecutionsResult> {
+  const suffix = queryString([
+    ['jobId', query.jobId],
+    ['projectId', query.projectId],
+    ['status', query.status],
+    ['trigger', query.trigger],
+    ['scheduledFrom', query.scheduledFrom],
+    ['scheduledTo', query.scheduledTo],
+    ['limit', query.limit],
+    ['cursor', query.cursor],
+  ])
+  return request<ListExecutionsResult>(`/api/executions${suffix}`)
+}
+
+/** 死信列表（= B6 `listDeadLetters`）：未重放优先 → `createdAt DESC` → `id DESC`。 */
+export function listDeadLetters(
+  query: ListDeadLettersQueryParams = {},
+): Promise<ListDeadLettersResult> {
+  const suffix = queryString([
+    ['jobId', query.jobId],
+    ['projectId', query.projectId],
+    ['replayState', query.replayState],
+    ['createdFrom', query.createdFrom],
+    ['createdTo', query.createdTo],
+    ['limit', query.limit],
+    ['cursor', query.cursor],
+  ])
+  return request<ListDeadLettersResult>(`/api/dead-letters${suffix}`)
+}
+
+/** 重放死信：平台以同一任务新建一条 `manual` 执行并重新投递，应答给出新的 `executionId`。 */
+export function replayDeadLetter(deadLetterId: string): Promise<ReplayDeadLetterResult> {
+  return request<ReplayDeadLetterResult>(
+    `/api/dead-letters/${encodeURIComponent(deadLetterId)}/replay`,
+    { method: 'POST' },
+  )
+}
+
+/**
+ * 501 占位判定：管理面还有子路径没挂载（`{ error: 'not_implemented', scope }`）。
+ * 页面据此区分「后端还没上这个接口」与「请求真的失败」，提示语不同。
+ */
+export function isNotImplementedError(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 501 || error.code === 'not_implemented')
 }
