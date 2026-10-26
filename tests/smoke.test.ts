@@ -23,7 +23,15 @@ describe('worker 骨架', () => {
   })
 
   it('B4 已挂载的管理面 / 注册 API 一律要求鉴权（无令牌 → 401，不再是 501 占位）', async () => {
-    for (const path of ['/api/jobs', '/api/projects', '/v1/jobs', '/v1/manifest', '/v1/whoami']) {
+    for (const path of [
+      '/api/jobs',
+      '/api/projects',
+      '/api/executions',
+      '/api/dead-letters',
+      '/v1/jobs',
+      '/v1/manifest',
+      '/v1/whoami',
+    ]) {
       const response = await app.request(path, {}, MINIMAL_ENV)
       expect(response.status, path).toBe(401)
       expect(await response.json()).toMatchObject({ error: { code: 'unauthorized' } })

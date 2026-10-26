@@ -729,7 +729,7 @@ describe('任务更新（管理面编辑）', () => {
     expect(unknownAction.status).toBe(404)
   })
 
-  it('建任务时项目不存在 → 404 project_not_found；未实现的管理面子路径 → 501', async () => {
+  it('建任务时项目不存在 → 404 project_not_found；仍未挂载的管理面子路径 → 501', async () => {
     const missing = await http<ErrorBody>(ctx, '/api/jobs', {
       method: 'POST',
       token,
@@ -738,7 +738,9 @@ describe('任务更新（管理面编辑）', () => {
     expect(missing.status).toBe(404)
     expect(missing.body.error.code).toBe('project_not_found')
 
-    const notImplemented = await http<{ error: string }>(ctx, '/api/executions', { token })
+    // 执行记录 / 死信三条路由已由 B7 挂载（见 tests/management-executions.test.ts），
+    // 这里改用一条仍未挂载的子路径，继续钉住「未挂载 = 501 而不是 404」这个信号。
+    const notImplemented = await http<{ error: string }>(ctx, '/api/metrics', { token })
     expect(notImplemented.status).toBe(501)
     expect(notImplemented.body.error).toBe('not_implemented')
   })
