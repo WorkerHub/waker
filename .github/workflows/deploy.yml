@@ -34,7 +34,7 @@ jobs:
           SETUP_SECRET: ${{ secrets.SETUP_SECRET }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           # 通过 → creds_ready=true；
           # 不通过 → creds_ready=false + 本步骤退出码 1（job/run 结论为 failure，缺凭据绝不能显示绿色）。
@@ -98,7 +98,7 @@ jobs:
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm exec wrangler deploy --secrets-file "$RUNNER_TEMP/secrets.json"
 
       - name: 清理明文 secrets 文件
