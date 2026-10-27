@@ -18,7 +18,7 @@ import {
 } from '@/components/ui/card'
 import { formatDateTime, formatRelative } from '@/lib/format'
 import {
-  PLATFORM_DOMAIN,
+  getPlatformDomain,
   PLATFORM_NAME,
   PLATFORM_REPO_URL,
   PLATFORM_SPEC,
@@ -83,7 +83,7 @@ export function SettingsPage() {
             <DetailSection title="标识">
               <DetailRow label="名称" value={`${PLATFORM_NAME} · ${PLATFORM_TAGLINE}`} />
               <DetailRow label="版本" value={PLATFORM_VERSION} mono />
-              <DetailRow label="域名" value={PLATFORM_DOMAIN} mono />
+              <DetailRow label="域名" value={getPlatformDomain()} mono />
               <DetailRow
                 label="仓库"
                 value={

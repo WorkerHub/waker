@@ -18,7 +18,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import {
-  PLATFORM_DOMAIN,
+  getPlatformDomain,
   PLATFORM_NAME,
   PLATFORM_REPO_URL,
   PLATFORM_RUNTIME,
@@ -107,7 +107,7 @@ export function AboutPage() {
           <CardContent>
             <DetailSection title="版本">
               <DetailRow label="版本" value={PLATFORM_VERSION} mono />
-              <DetailRow label="域名" value={PLATFORM_DOMAIN} mono />
+              <DetailRow label="域名" value={getPlatformDomain()} mono />
               <DetailRow label="规格" value={PLATFORM_SPEC} />
               <DetailRow
                 label="仓库"
