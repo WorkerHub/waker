@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import type { MeView } from '@/lib/auth-api'
 import { formatDateTime } from '@/lib/format'
-import { PLATFORM_DOMAIN, PLATFORM_REPO_URL, PLATFORM_VERSION } from '@/lib/platform'
+import { getPlatformDomain, PLATFORM_REPO_URL, PLATFORM_VERSION } from '@/lib/platform'
 import { SettingsPage } from '@/pages/settings-page'
 import {
   authenticate,
@@ -72,7 +72,9 @@ describe('设置页', () => {
 
     // 平台信息是构建期事实：版本来自 __APP_VERSION__（vitest 里注入 'test'）。
     expect(screen.getAllByText(PLATFORM_VERSION).length).toBeGreaterThan(0)
-    expect(container.textContent).toContain(PLATFORM_DOMAIN)
+    // 域名是运行时事实：取当前访问域名，不用构建期写死的值。
+    expect(getPlatformDomain()).toBe(window.location.host)
+    expect(container.textContent).toContain(window.location.host)
     expect(screen.getByRole('link', { name: PLATFORM_REPO_URL })).toHaveAttribute(
       'href',
       PLATFORM_REPO_URL,

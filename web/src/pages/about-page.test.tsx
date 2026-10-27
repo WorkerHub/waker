@@ -2,11 +2,7 @@ import { screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
 import { AboutPage } from '@/pages/about-page'
-import {
-  PLATFORM_DOMAIN,
-  PLATFORM_REPO_URL,
-  PLATFORM_VERSION,
-} from '@/lib/platform'
+import { getPlatformDomain, PLATFORM_REPO_URL, PLATFORM_VERSION } from '@/lib/platform'
 import { installFetchMock, renderWithProviders } from '@/test/utils'
 
 /** 关于页 smoke：纯静态页面可加载，内容与 SPEC v1.0 一致，且不发任何请求。 */
@@ -26,9 +22,10 @@ describe('关于页', () => {
     expect(screen.getByText('回调协议 v2')).toBeInTheDocument()
     expect(screen.getAllByText(/1（watchdog，每小时）/).length).toBeGreaterThan(0)
 
-    // 版本与环境
+    // 版本与环境；域名取运行时当前访问域名（test 环境：jsdom 的 location.host）
     expect(screen.getAllByText(PLATFORM_VERSION).length).toBeGreaterThan(0)
-    expect(container.textContent).toContain(PLATFORM_DOMAIN)
+    expect(getPlatformDomain()).toBe(window.location.host)
+    expect(container.textContent).toContain(window.location.host)
     expect(screen.getByRole('link', { name: PLATFORM_REPO_URL })).toHaveAttribute(
       'href',
       PLATFORM_REPO_URL,
