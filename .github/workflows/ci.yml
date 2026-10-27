@@ -23,7 +23,7 @@ jobs:
       SETUP_SECRET: ci-placeholder-not-a-real-secret
       JWT_SECRET: ci-placeholder-not-a-real-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: pnpm/action-setup@v4
 
