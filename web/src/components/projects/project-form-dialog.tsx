@@ -119,7 +119,7 @@ export function ProjectFormDialog({
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="project-name">项目名</FieldLabel>
-              <Input id="project-name" placeholder="shortlink" {...form.register('name')} />
+              <Input id="project-name" placeholder="your-worker" {...form.register('name')} />
               <FieldError errors={[form.formState.errors.name]} />
             </Field>
 
@@ -127,7 +127,7 @@ export function ProjectFormDialog({
               <FieldLabel htmlFor="project-callback-url">回调地址</FieldLabel>
               <Input
                 id="project-callback-url"
-                placeholder="https://shortlink.oneboy.app"
+                placeholder="https://your-worker.example.com"
                 autoComplete="off"
                 spellCheck={false}
                 {...form.register('callbackUrl')}
