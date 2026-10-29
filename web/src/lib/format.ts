@@ -52,23 +52,6 @@ export function formatRelative(value: number | null | undefined, now = Date.now(
   return relativeFormatter.format(Math.round(diff / chosen[1]), chosen[0])
 }
 
-/** 时区下拉候选：浏览器支持的 IANA 列表（契约要求 IANA 时区名）。 */
-export function supportedTimeZones(): string[] {
-  const supported = (
-    Intl as unknown as { supportedValuesOf?: (key: 'timeZone') => string[] }
-  ).supportedValuesOf
-  if (typeof supported === 'function') return supported.call(Intl, 'timeZone')
-  return ['UTC']
-}
-
-export function browserTimeZone(): string {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
-  } catch {
-    return 'UTC'
-  }
-}
-
 /** epoch 毫秒 → `<input type="datetime-local">` 的 value（本地时区）。 */
 export function toDateTimeLocal(value: number | null | undefined): string {
   if (value === null || value === undefined) return ''

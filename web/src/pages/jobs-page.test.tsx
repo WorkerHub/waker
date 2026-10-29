@@ -159,6 +159,100 @@ describe('任务管理页', () => {
     expect(fetchMock.mock.calls.some((call) => requestBody(call).name === 'bad-cron')).toBe(false)
   })
 
+  it('时区下拉直接列出常用预置，并按所选时区提交', async () => {
+    const fetchMock = installFetchMock((url, init) => {
+      if (url.startsWith('/api/projects')) return { body: { projects: [project] } }
+      if (url === '/api/jobs' && init.method === 'POST') {
+        return { status: 201, body: { job: makeJob({ name: 'tokyo-job', timezone: 'Asia/Tokyo' }) } }
+      }
+      if (url.startsWith('/api/jobs')) return { body: { jobs: [], nextCursor: null } }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<JobsPage />)
+    await user.click((await screen.findAllByRole('button', { name: /新建任务/ }))[0]!)
+
+    // 18 个常用预置 + 「自定义」一项，全部是下拉里看得见的选项（不再靠浏览器补全）
+    const timezoneSelect = screen.getByLabelText('时区')
+    const timezoneOptions = within(timezoneSelect).getAllByRole('option')
+    expect(timezoneOptions).toHaveLength(19)
+    expect(screen.getByRole('option', { name: /^UTC（GMT/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /^Asia\/Shanghai（GMT\+8）$/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /^America\/New_York（GMT[+-]/ })).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('任务名'), 'tokyo-job')
+    await user.clear(screen.getByLabelText('cron 表达式'))
+    await user.type(screen.getByLabelText('cron 表达式'), '0 3 * * *')
+    await user.selectOptions(timezoneSelect, 'Asia/Tokyo')
+    await user.click(screen.getByRole('button', { name: /创建任务/ }))
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find((call) => requestUrl(call) === '/api/jobs')
+      expect(postCall).toBeDefined()
+      expect(requestBody(postCall).timezone).toBe('Asia/Tokyo')
+    })
+  })
+
+  it('切到自定义后可手填任意 IANA 时区名', async () => {
+    const fetchMock = installFetchMock((url, init) => {
+      if (url.startsWith('/api/projects')) return { body: { projects: [project] } }
+      if (url === '/api/jobs' && init.method === 'POST') {
+        return { status: 201, body: { job: makeJob({ name: 'berlin-job' }) } }
+      }
+      if (url.startsWith('/api/jobs')) return { body: { jobs: [], nextCursor: null } }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<JobsPage />)
+    await user.click((await screen.findAllByRole('button', { name: /新建任务/ }))[0]!)
+
+    await user.type(screen.getByLabelText('任务名'), 'berlin-job')
+    await user.clear(screen.getByLabelText('cron 表达式'))
+    await user.type(screen.getByLabelText('cron 表达式'), '0 3 * * *')
+    await user.selectOptions(screen.getByLabelText('时区'), '__custom__')
+
+    const manualInput = screen.getByLabelText('自定义 IANA 时区')
+    await user.clear(manualInput)
+    await user.type(manualInput, 'Europe/Berlin')
+    await user.click(screen.getByRole('button', { name: /创建任务/ }))
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find((call) => requestUrl(call) === '/api/jobs')
+      expect(postCall).toBeDefined()
+      expect(requestBody(postCall).timezone).toBe('Europe/Berlin')
+    })
+  })
+
+  it('自定义时区非法时在前端拦下，不发请求', async () => {
+    const fetchMock = installFetchMock((url) => {
+      if (url.startsWith('/api/projects')) return { body: { projects: [project] } }
+      if (url.startsWith('/api/jobs')) return { body: { jobs: [], nextCursor: null } }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    authenticate()
+    const user = userEvent.setup()
+
+    renderWithProviders(<JobsPage />)
+    await user.click((await screen.findAllByRole('button', { name: /新建任务/ }))[0]!)
+
+    await user.type(screen.getByLabelText('任务名'), 'bad-tz')
+    await user.clear(screen.getByLabelText('cron 表达式'))
+    await user.type(screen.getByLabelText('cron 表达式'), '0 3 * * *')
+    await user.selectOptions(screen.getByLabelText('时区'), '__custom__')
+
+    const manualInput = screen.getByLabelText('自定义 IANA 时区')
+    await user.clear(manualInput)
+    await user.type(manualInput, 'Mars/Base')
+    await user.click(screen.getByRole('button', { name: /创建任务/ }))
+
+    expect(await screen.findByText('不是合法的 IANA 时区名')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some((call) => requestBody(call).name === 'bad-tz')).toBe(false)
+  })
+
   it('手动触发：调用 trigger 接口并展示 executionId', async () => {
     const fetchMock = installFetchMock((url) => {
       if (url.startsWith('/api/projects')) return { body: { projects: [project] } }
