@@ -1,11 +1,12 @@
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertCircleIcon, Loader2Icon, SaveIcon } from 'lucide-react'
-import { useEffect, useId } from 'react'
+import { useEffect } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
+import { TimeZoneField } from '@/components/jobs/timezone-field'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,20 +34,20 @@ import {
   type UpdateJobInput,
 } from '@/lib/api'
 import {
-  browserTimeZone,
   fromDateTimeLocal,
   parsePayloadText,
   prettyJson,
-  supportedTimeZones,
   toDateTimeLocal,
 } from '@/lib/format'
 import { CONCURRENCY_LABEL, MISFIRE_LABEL } from '@/lib/jobs'
+import { browserTimeZone, isValidTimeZone } from '@/lib/timezones'
 
 /**
  * 任务新建 / 编辑表单，字段严格取自 B2 冻结的 `CreateJobInput` / `UpdateJobInput`。
  *
  * 客户端只做「必填 + 契约范围」的即时校验（策略字段上下限与后端一致）；
- * cron 表达式与 IANA 时区的**真假判定一律交给后端**（CF 方言解析器只有一份），
+ * cron 表达式与 IANA 时区的**真假判定仍以后端为准**（CF 方言解析器只有一份，
+ * 时区合法性由 `assertTimezone` 终裁；前端只用同机制的 `Intl` 做一次即时预检），
  * 后端返回的 `invalid_cron` / `invalid_timezone` 错误码与 details 原样展示。
  */
 const policiesSchema = z.object({
@@ -98,6 +99,15 @@ const jobFormSchema = z
         code: 'custom',
         path: ['payloadText'],
         message: `载荷必须是合法 JSON：${payload.error}`,
+      })
+    }
+
+    // 即时预检用与后端 `assertTimezone` 同机制的 Intl；非空由 min(1) 单独负责。
+    if (values.timezone !== '' && !isValidTimeZone(values.timezone)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['timezone'],
+        message: '不是合法的 IANA 时区名',
       })
     }
   })
@@ -158,7 +168,6 @@ export function JobFormDialog({
   job?: JobView
   projects: ProjectView[]
 }) {
-  const timezoneListId = useId()
   const queryClient = useQueryClient()
 
   const form = useForm<JobFormValues>({
@@ -308,23 +317,18 @@ export function JobFormDialog({
                 />
               </Field>
 
-              <Field>
-                <FieldLabel htmlFor="job-timezone">时区</FieldLabel>
-                <Input
-                  id="job-timezone"
-                  list={timezoneListId}
-                  placeholder="Asia/Shanghai"
-                  autoComplete="off"
-                  spellCheck={false}
-                  {...form.register('timezone')}
-                />
-                <datalist id={timezoneListId}>
-                  {supportedTimeZones().map((zone) => (
-                    <option key={zone} value={zone} />
-                  ))}
-                </datalist>
-                <FieldError errors={[form.formState.errors.timezone]} />
-              </Field>
+              <Controller
+                control={form.control}
+                name="timezone"
+                render={({ field }) => (
+                  <TimeZoneField
+                    id="job-timezone"
+                    value={field.value}
+                    onChange={field.onChange}
+                    error={form.formState.errors.timezone}
+                  />
+                )}
+              />
             </div>
 
             {kind === 'cron' ? (
