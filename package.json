@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@simplewebauthn/server": "^14.0.3",
-    "croner": "^10.0.1",
+    "croner": "^11.0.0",
     "hono": "^4.13.14",
     "otpauth": "^9.5.2"
   },
